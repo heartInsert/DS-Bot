@@ -393,7 +393,7 @@ export function deviceTools({ hub, ready = Promise.resolve({ ok: true }), shared
 // flag is always present so a stopped hub still shows within a poll.
 export function hubChatAnswer({ replica, status, reference, cursor } = {}) {
   const offline = status === 'offline' || status === 'unauthorized'
-  const base = { reference, offline, status, epoch: replica?.epoch, revision: replica?.revision }
+  const base = { reference, offline, status, epoch: replica?.epoch, revision: replica?.revision, earlier: replica?.cursor ?? null }
   const upToDate = cursor !== undefined && replica !== undefined
     && replica.epoch === cursor.epoch && replica.revision === cursor.revision
   if (upToDate) return { ...base, unchanged: true }
@@ -419,6 +419,13 @@ export async function readHubChat(session, reference, cursor) {
 export async function sendHubChat(session, reference, text, messageId) {
   await session.open(reference)
   return session.send(text, { messageId })
+}
+
+// A joined node's hub-earlier read: the page before the replica's cursor, returned as
+// the items to prepend and the next cursor.
+export async function readHubEarlier(session, reference) {
+  await session.open(reference)
+  return session.earlier(reference)
 }
 
 export function install(rt) {
@@ -456,7 +463,9 @@ export function install(rt) {
   // writer of the Session, and a node only ever reads snapshots of it.
   let sessionSync
   try {
-    sessionSync = createSessionSync({ rt })
+    // The accepted-send log lives beside nodes.json in the hub dataDir, so a retry after
+    // a hub restart still lands once.
+    sessionSync = createSessionSync({ rt, dataDir: options.dataDir, log: (...args) => rt.warn(...args) })
   } catch (error) {
     rt.warn('ds-bot: LAN session sync is off: %s', error.message)
   }
@@ -876,6 +885,17 @@ export function install(rt) {
     }
   }
 
+  const hubEarlier = async (body = {}) => {
+    const session = nodeWorker?.session?.()
+    if (session === undefined) throw new Error('This computer is not joined to a hub.')
+    try {
+      return await readHubEarlier(session, hubReference(body))
+    } catch (error) {
+      if (error?.code === 'hub/offline' || error?.fatal === true) throw error
+      throw new Error(`The hub is not reachable; the earlier messages were not loaded. ${error?.message ?? ''}`.trim())
+    }
+  }
+
   Object.defineProperty(rt, 'multiDeviceEnabled', { get: () => enabled, configurable: true })
   Object.defineProperty(rt, 'multiDeviceError', { get: () => failure, configurable: true })
   Object.assign(rt, {
@@ -896,6 +916,7 @@ export function install(rt) {
     // The hub conversation for the node's chat view: read a replica or send a message.
     multiDeviceHubConversation: hubConversation,
     multiDeviceHubSend: hubSend,
+    multiDeviceHubEarlier: hubEarlier,
   })
 
   // The saved choice is read once the team file is loaded; the profile only supplies

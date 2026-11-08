@@ -9,13 +9,28 @@
 // its Session and its event seq, so a re-snapshot (a reset, a reconnect) can be de-duped
 // by the node rather than appended twice.
 import { createHash, randomBytes } from 'node:crypto'
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 export const MAX_MESSAGE_CHARS = 32 * 1024
 export const MAX_ITEMS = 200
 export const MAX_SNAPSHOT_BYTES = 1.5 * 1024 * 1024
 export const MAX_WAIT_MS = 25_000
 export const DEFAULT_WAIT_MS = 20_000
-const APPLIED_LIMIT = 500
+
+// The send log keeps accepted message ids so a retry after a hub restart still lands
+// once. It is keyed per conversation (`bot:<id>` / `room:<id>`), keeps the resulting
+// message reference (the run epoch and revision) for an idempotent reply, and is
+// pruned both by age and by count so it stays bounded.
+export const SEND_LOG_FILE = 'send-dedupe.json'
+// Seven days: long enough to cover a machine that was offline over a weekend, short
+// enough that the file cannot grow without bound from everyday sends.
+export const SEND_ID_TTL_MS = 7 * 24 * 60 * 60 * 1000
+// A conversation rarely exceeds a thousand sends in a week; the per-conversation cap
+// keeps one busy chat from evicting every other chat's ids, and the global cap is the
+// last line against an unbounded file regardless of how many conversations exist.
+export const MAX_IDS_PER_CONVERSATION = 1000
+export const MAX_TOTAL_IDS = 10_000
 
 const fail = (message, status = 400) => Object.assign(new Error(message), { status })
 const notFound = message => fail(message, 404)
@@ -58,7 +73,7 @@ export const keyOf = reference => {
   return `${conv.kind}:${conv.id}`
 }
 
-export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxItems = MAX_ITEMS } = {}) {
+export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now, refreshMs = 1_000, maxItems = MAX_ITEMS } = {}) {
   if (rt === undefined || typeof rt.chatPage !== 'function' || typeof rt.sendUser !== 'function') {
     throw new Error('createSessionSync needs the plugin runtime')
   }
@@ -69,10 +84,160 @@ export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxIt
   const entries = new Map()
   const waiters = new Map()
   const rendering = new Map()
+  // Accepted sends, keyed per conversation so one conversation's id never shadows
+  // another's: `applyKey` joins the conversation reference and the client's id. The
+  // entry keeps the reference and id so the reply and the file read them back.
   const applied = new Map()
+  const applyKey = (conv, id) => `${conv}\u0000${id}`
+  // A send that is still in flight, so two concurrent submits of the same id wait for
+  // the one write instead of racing it.
+  const inflight = new Map()
+
+  // The durable send log. Without a dataDir the hub is a CLI process with no team, so
+  // the dedupe is in-memory only (the first protocol's behavior).
+  const sendFile = typeof dataDir === 'string' && dataDir !== ''
+    ? join(dataDir, SEND_LOG_FILE)
+    : undefined
+
+  function pruneApplied() {
+    const at = now()
+    for (const [key, entry] of applied) {
+      if (at - entry.at > SEND_ID_TTL_MS) applied.delete(key)
+    }
+    // Newest N per conversation, then a global cap across all conversations.
+    const perConversation = new Map()
+    for (const entry of applied.values()) {
+      const list = perConversation.get(entry.conv) ?? []
+      list.push(entry)
+      perConversation.set(entry.conv, list)
+    }
+    for (const list of perConversation.values()) {
+      list.sort((left, right) => right.at - left.at)
+      for (const entry of list.slice(MAX_IDS_PER_CONVERSATION)) applied.delete(applyKey(entry.conv, entry.id))
+    }
+    if (applied.size > MAX_TOTAL_IDS) {
+      const oldest = [...applied.values()].sort((left, right) => left.at - right.at)
+      for (const entry of oldest.slice(0, applied.size - MAX_TOTAL_IDS)) applied.delete(applyKey(entry.conv, entry.id))
+    }
+  }
+
+  function persistApplied() {
+    if (sendFile === undefined) return
+    pruneApplied()
+    const conversations = {}
+    for (const entry of applied.values()) {
+      const list = conversations[entry.conv] ?? (conversations[entry.conv] = [])
+      list.push({
+        id: entry.id,
+        text: entry.text,
+        at: entry.at,
+        state: entry.state,
+        ...(entry.epoch !== undefined ? { epoch: entry.epoch } : {}),
+        ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
+        ...(entry.acceptedAt !== undefined ? { acceptedAt: entry.acceptedAt } : {}),
+      })
+    }
+    for (const list of Object.values(conversations)) list.sort((left, right) => left.at - right.at)
+    // Atomic: write a sibling temp file, then rename over the real one. The mode is
+    // 0600 (the log carries no secret, but a message id and text belong to the user).
+    const payload = `${JSON.stringify({ version: 1, conversations }, null, 2)}\n`
+    const temp = `${sendFile}.${process.pid}.tmp`
+    try {
+      writeFileSync(temp, payload, { mode: 0o600 })
+      renameSync(temp, sendFile)
+      if (process.platform !== 'win32') {
+        try { chmodSync(sendFile, 0o600) } catch { /* a file system without modes keeps the 0600 write */ }
+      }
+    } catch (error) {
+      log('ds-bot lan: could not write %s: %s', sendFile, error.message)
+    }
+  }
+
+  function loadApplied() {
+    let text
+    try {
+      text = readFileSync(sendFile, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') log('ds-bot lan: could not read %s: %s', sendFile, error.message)
+      return
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch (error) {
+      log('ds-bot lan: the send log %s is corrupt (%s); starting without it', sendFile, error.message)
+      return
+    }
+    if (parsed === null || typeof parsed !== 'object' || parsed.conversations === null || typeof parsed.conversations !== 'object') {
+      log('ds-bot lan: the send log %s has an unknown shape; starting without it', sendFile)
+      return
+    }
+    const at = now()
+    let loaded = 0
+    for (const [conv, list] of Object.entries(parsed.conversations)) {
+      if (typeof conv !== 'string' || conv === '' || !Array.isArray(list)) continue
+      for (const raw of list.slice(-MAX_IDS_PER_CONVERSATION)) {
+        if (raw === null || typeof raw !== 'object') continue
+        if (typeof raw.id !== 'string' || raw.id === '') continue
+        if (typeof raw.text !== 'string' || !Number.isInteger(raw.at)) continue
+        if (at - raw.at > SEND_ID_TTL_MS) continue
+        const entry = {
+          id: raw.id,
+          conv,
+          text: raw.text,
+          at: raw.at,
+          state: raw.state === 'pending' ? 'pending' : 'committed',
+        }
+        if (typeof raw.epoch === 'string') entry.epoch = raw.epoch
+        if (Number.isInteger(raw.revision)) entry.revision = raw.revision
+        if (typeof raw.acceptedAt === 'string') entry.acceptedAt = raw.acceptedAt
+        applied.set(applyKey(conv, raw.id), entry)
+        loaded += 1
+      }
+    }
+    if (loaded > 0) log('ds-bot lan: loaded %d accepted sends from %s', loaded, sendFile)
+  }
+
+  if (sendFile !== undefined) {
+    try { mkdirSync(dataDir, { recursive: true }) } catch (error) { log('ds-bot lan: could not make %s: %s', dataDir, error.message) }
+    loadApplied()
+  }
+
+  // A pending entry was recorded before its write and left uncommitted by a crash. The
+  // write is the only side effect a pending entry guards (a user message, never a model
+  // turn or a tool), so on restart we only need to know whether it landed: look for a
+  // user message with the same text in the conversation's current tail. Found → treat
+  // as committed (a retry answers "already sent"); not found → drop it, so a retry
+  // writes once. Either way no model turn is re-run.
+  let reconciled = false
+  async function reconcilePending() {
+    if (reconciled || sendFile === undefined) return
+    reconciled = true
+    const pending = [...applied.values()].filter(entry => entry.state === 'pending')
+    if (pending.length === 0) return
+    for (const entry of pending) {
+      let landed = false
+      try {
+        const page = pageOf(entry.conv)
+        const rendered = await page.sessionOf()
+        const items = Array.isArray(rendered.items) ? rendered.items : []
+        landed = items.some(item => item?.kind === 'user' && String(item.text ?? '').trim() === entry.text)
+      } catch (error) {
+        log('ds-bot lan: could not check whether pending send %s landed: %s', entry.id, error.message)
+      }
+      if (landed) {
+        entry.state = 'committed'
+        if (entry.acceptedAt === undefined) entry.acceptedAt = new Date(entry.at).toISOString()
+      } else {
+        applied.delete(applyKey(entry.conv, entry.id))
+      }
+    }
+    persistApplied()
+  }
 
   const ready = async () => {
     if (typeof rt.load === 'function') await rt.load()
+    await reconcilePending()
   }
 
   function botNamed(id) {
@@ -118,11 +283,11 @@ export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxIt
     if (conv.kind === 'bot') {
       const bot = botNamed(conv.id)
       if (typeof rt.chatPage !== 'function') throw notFound('no Bot chat is served here')
-      return { conv: { kind: 'bot', id: bot.id }, name: bot.name, sessionOf: () => rt.chatPage(bot.id) }
+      return { conv: { kind: 'bot', id: bot.id }, name: bot.name, sessionOf: cursor => rt.chatPage(bot.id, cursor) }
     }
     const room = roomNamed(conv.id)
     if (typeof rt.roomPage !== 'function') throw notFound('no group chat is served here')
-    return { conv: { kind: 'room', id: room.id }, name: room.name ?? room.id, sessionOf: () => rt.roomPage(room.id) }
+    return { conv: { kind: 'room', id: room.id }, name: room.name ?? room.id, sessionOf: cursor => rt.roomPage(room.id, cursor) }
   }
 
   // Stable ids: an item with a seq names `${sessionId}:${seq}`, disambiguated by how many
@@ -164,6 +329,50 @@ export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxIt
     for (const done of set) done()
   }
 
+  // `before` names where an earlier page begins: the cursor a snapshot handed back
+  // (`{part, beforeSeq}`), a bare seq, or a stable item id (`session:seq:n`). The seq
+  // forms page the current part; the cursor form can cross into earlier parts.
+  function cursorOf(before) {
+    if (before === undefined || before === null) return undefined
+    if (typeof before === 'object') {
+      const part = Number.isInteger(before.part) ? before.part : undefined
+      const beforeSeq = Number.isInteger(before.beforeSeq) ? before.beforeSeq : undefined
+      return part === undefined && beforeSeq === undefined ? undefined : { ...(part === undefined ? {} : { part }), ...(beforeSeq === undefined ? {} : { beforeSeq }) }
+    }
+    const text = String(before).trim()
+    if (text === '') return undefined
+    if (/^\d+$/.test(text)) {
+      const seq = Number(text)
+      return seq > 0 ? { beforeSeq: seq } : undefined
+    }
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed !== null && typeof parsed === 'object') return cursorOf(parsed)
+    } catch {
+      // Not JSON: fall through to the id form.
+    }
+    const idSeq = /:(\d+):(\d+)$/.exec(text)
+    if (idSeq === null) return undefined
+    const seq = Number(idSeq[1])
+    return seq > 0 ? { beforeSeq: seq } : undefined
+  }
+
+  // The page before `before`, through the same `chatPage`/`roomPage` the live chat's
+  // "Load earlier" uses, so earlier parts and their part lines page the same way.
+  async function earlier(reference, { before } = {}) {
+    await ready()
+    const page = pageOf(reference)
+    const rendered = await page.sessionOf(cursorOf(before))
+    const all = Array.isArray(rendered.items) ? rendered.items : []
+    const capped = capItems(all.slice(-maxItems))
+    return {
+      epoch,
+      ...(page.conv.kind === 'bot' ? { botId: page.conv.id } : { roomId: page.conv.id }),
+      sessionId: rendered.sessionId ?? null,
+      items: stampIds(rendered.sessionId ?? null, capped.items),
+      cursor: rendered.cursor ?? null,
+    }
+  }
   function publish(rendered) {
     const key = keyOf(rendered.conv)
     const previous = entries.get(key)
@@ -254,8 +463,9 @@ export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxIt
 
   // A node's message is applied through the same path as the browser's composer, so the
   // Bot, the group log and the search index see one ordinary user message. `messageId`
-  // makes a retry on a flaky link land once; the same id is kept for the hub run, so a
-  // reconnect within one run cannot write the message a second time.
+  // makes a retry on a flaky link land once, even across a hub restart: the id is
+  // recorded as pending before the write and committed after, and a retry answers with
+  // the same result instead of writing again.
   async function send({ botId, roomId, text, messageId } = {}) {
     await ready()
     const reference = roomId !== undefined && roomId !== ''
@@ -266,22 +476,64 @@ export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxIt
     if (value === '') throw fail('the message is empty')
     if (value.length > MAX_MESSAGE_CHARS) throw fail(`the message is longer than ${MAX_MESSAGE_CHARS} characters`)
     const id = typeof messageId === 'string' && messageId.trim() !== '' ? messageId.trim().slice(0, 80) : undefined
-    const seen = id === undefined ? undefined : applied.get(id)
-    if (seen !== undefined) {
-      const key = keyOf(reference)
-      return { ok: true, duplicate: true, ...(page.conv.kind === 'bot' ? { botId: page.conv.id } : { roomId: page.conv.id }), epoch, revision: entries.get(key)?.revision ?? revision, messageId: id, acceptedAt: seen }
-    }
-    if (typeof rt.readOnly === 'function' && rt.readOnly() !== undefined) {
-      throw fail('this computer is only reading the Bot team, so it cannot add a message', 409)
-    }
-    await rt.sendUser({ sessionId: page.conv.id, content: [{ type: 'text', text: value }] })
-    const acceptedAt = new Date(now()).toISOString()
+    const key = keyOf(reference)
+
+    // The reply a committed id returns: the same reference and accepted time as the
+    // original write, so a retry is indistinguishable from the first answer.
+    const duplicateReply = entry => ({
+      ok: true,
+      duplicate: true,
+      ...(page.conv.kind === 'bot' ? { botId: page.conv.id } : { roomId: page.conv.id }),
+      epoch: entry.epoch ?? epoch,
+      revision: entry.revision ?? entries.get(key)?.revision ?? revision,
+      messageId: id,
+      acceptedAt: entry.acceptedAt ?? new Date(entry.at).toISOString(),
+    })
+
     if (id !== undefined) {
-      applied.set(id, acceptedAt)
-      while (applied.size > APPLIED_LIMIT) applied.delete(applied.keys().next().value)
+      const seen = applied.get(applyKey(key, id))
+      if (seen !== undefined && seen.state === 'committed') return duplicateReply(seen)
+      // A concurrent submit of the same id waits for the one that is already in
+      // flight, so two racing requests never write twice.
+      const running = inflight.get(id)
+      if (running !== undefined) return running
     }
-    const entry = await refresh(reference).catch(() => undefined)
-    return { ok: true, ...(page.conv.kind === 'bot' ? { botId: page.conv.id } : { roomId: page.conv.id }), epoch, revision: entry?.revision ?? revision, messageId: id, acceptedAt }
+
+    const run = (async () => {
+      if (id !== undefined) {
+        const seen = applied.get(applyKey(key, id))
+        if (seen !== undefined && seen.state === 'committed') return duplicateReply(seen)
+      }
+      if (typeof rt.readOnly === 'function' && rt.readOnly() !== undefined) {
+        throw fail('this computer is only reading the Bot team, so it cannot add a message', 409)
+      }
+      const at = now()
+      // Record before the write: if the process dies inside `sendUser`, the restart can
+      // tell whether the message landed. The write is a plain user message — never a
+      // model turn or a tool — so there is no side effect to replay, and at-most-once
+      // for the model turn is preserved: a pending entry whose message is not found is
+      // dropped, never re-sent by the hub on its own.
+      if (id !== undefined) {
+        applied.set(applyKey(key, id), { id, conv: key, text: value, at, state: 'pending' })
+        persistApplied()
+      }
+      await rt.sendUser({ sessionId: page.conv.id, content: [{ type: 'text', text: value }] })
+      const acceptedAt = new Date(now()).toISOString()
+      const entry = await refresh(reference).catch(() => undefined)
+      const landedRevision = entry?.revision ?? revision
+      if (id !== undefined) {
+        applied.set(applyKey(key, id), { id, conv: key, text: value, at, state: 'committed', epoch, revision: landedRevision, acceptedAt })
+        persistApplied()
+      }
+      return { ok: true, ...(page.conv.kind === 'bot' ? { botId: page.conv.id } : { roomId: page.conv.id }), epoch, revision: landedRevision, messageId: id, acceptedAt }
+    })()
+
+    if (id !== undefined) inflight.set(id, run)
+    try {
+      return await run
+    } finally {
+      if (id !== undefined && inflight.get(id) === run) inflight.delete(id)
+    }
   }
 
   return {
@@ -293,12 +545,14 @@ export function createSessionSync({ rt, now = Date.now, refreshMs = 1_000, maxIt
     // An alias the hub exposes for "the whole team, at once".
     list: bots,
     snapshot,
+    earlier,
     send,
     // The Devices page and tests read this without touching a node.
     status: () => ({
       epoch,
       revision,
       synced: entries.size,
+      accepted: applied.size,
       waiting: [...waiters.values()].reduce((total, set) => total + set.size, 0),
     }),
   }
