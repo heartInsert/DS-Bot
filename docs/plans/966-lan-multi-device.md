@@ -1,4 +1,4 @@
-# 局域网多机：Hub、通用任务、常驻 worker 与会话同步（v3）
+# 局域网多机：Hub、通用任务、常驻 worker 与会话同步（v4）
 
 - 日期：2026-11-08
 - 相关：Issue #966
@@ -21,6 +21,17 @@ CEO 的定调：Mac 是**中心**，也是会话的**唯一写者**；其他机�
 3. **节点侧同步循环。** Worker 在 SSE 连上后跟随主 Bot（`--sync main`，可换 Bot）：长轮询、原子写 `sync/<botId>.json` 只读副本、断线退避、重启按游标补拉；`lan:say` 从节点发一条消息。
 4. **配对即生效。** `lan:worker` 和守护安装命令默认带 `--sync main`；不同步可用 `--no-sync`。Devices 状态的 `sync` 字段给出当前版本、已有快照的 Bot 数和等待中的轮询数。
 5. **验收。** `dev/lan-sync-accept.mjs sync` 用两个配对节点进程证明中心→节点、节点→中心、第二节点追上、断线重连补齐，证据不含令牌或配对码。
+
+## v4 做了什么
+
+CEO 的定调：配对不能靠命令行。**中心在 Devices 页开一下，节点在自己的 Devices 页看见它，点「加入」，中心点「允许」**，不需要复制任何命令。安装版节点（Windows 的 DS Bot）也必须能这样加入。
+
+1. **发现（`discovery.js`）。** 中心在 UDP 8789 上回答一个探测报文；节点从临时端口发广播，读单播回复，并用**回复到达的地址**拼出 Hub URL（所以 Hub 绑哪个网卡都能连）。探测先发出去，主机防火墙看到的是自己发出的报文的回复；收不到时可退回页面的「高级」手动地址。
+2. **加入（`join.js`）。** 节点 `POST /join` 报上名字、主机名、系统；Hub 只把它记成一条待批请求（5 分钟、每地址最多 3 条、最多 8 条待批），**不配对、不发令牌**。节点 `GET /join/<id>?wait=` 长轮询等结果；中心在 Devices 页点「允许」才创建节点并回令牌，点「拒绝」则什么都不留。请求幂等：同一地址和主机名重复发，返回同一条。
+3. **节点在插件里跑 worker。** 加入成功后令牌写 `device.json`（0600），加入的选择写进团队文件 `state.json` 的 `multiDevice.node`；插件进程直接起 `createWorker`（`--sync main` 同等行为），断线/重启自动用 `device.json` 重连。安装版 Windows 不再需要 Node 工程、终端或 `npm`。
+4. **Devices 页精简。** 只有三块：这台电脑（开关 / 已加入的中心）、已配对设备（在线状态、移除、待批请求的允许/拒绝）、附近的中心（点「加入」）。原来那屏说明文字、长命令块和「怎么工作」段落删掉；配对码、worker 命令、守护命令都收进「高级」，主路径上没有命令。
+5. **一个中心。** 本机加入别人之后自己不再当 Hub（开关收起，退出加入后恢复）；后台启动时也按这个规则来。`multiDevice: false` 仍是硬关闭，加入也一并不可用。
+6. **验收。** `test/lan-discovery.test.js` 覆盖发现、待批/允许/拒绝、令牌只在允许后出现；`test/lan-join.test.js` 用两个插件 runtime 跑完整路径：中心开 → 节点 `multiDeviceScan` 看见 → `multiDeviceJoin` → 中心 `multiDeviceApproveJoin` → 节点 `online` → 中心派 `echo` 拿到输出 → 退出加入后离线。本机另用「CLI hub 进程 + 节点脚本」两进程复跑过一次，证据在提交说明里。
 
 ## v2 做了什么（六条）
 
@@ -176,16 +187,27 @@ dsh --profile web --host <中心机器的局域网 IP> --no-open
 
 ### Settings → Devices（客户端开关）
 
-`config.multiDevice` 只决定第一次启动。用户在 **Settings → Devices** 拨过开关之后，选择保存在团队文件 `state.json` 的 `multiDevice.enabled` 里，下次启动以它为准：关了就是关，不会因为 profile 里还写着 `multiDevice: true` 又起来。`multiDevice: false` 是硬关闭，页面上开关不可用。
+`config.multiDevice` 只决定第一次启动。用户在 **Settings → Devices** 拨过开关之后，选择保存在团队文件 `state.json` 的 `multiDevice.enabled` 里，下次启动以它为准：关了就是关，不会因为 profile 里还写着 `multiDevice: true` 又起来。`multiDevice: false` 是硬关闭，两个角色都不可用。
 
-页面直接走 `/api/bot` 的 `multi-device-*` 端点，不要求用户改 YAML 或手编 `nodes.json`：
+页面只有三块，主路径上没有一个命令：
 
-- `multi-device-status`（只读）：开关是否可用、是否打开、Hub 状态（`off`/`starting`/`listening`/`failed`）与错误、端口、局域网 URL、本机 URL、DSH Web 的共享地址、已配对节点（名字、在线、OS/架构、hostname、最后联系时间）、只读命令、是否要求审批读取、常驻 worker 的安装/卸载/状态命令。
+1. **这台电脑**：中心开关；如果这台已经加入别的中心，就只有「已加入 <名字> · 在线/离线」和「退出」。
+2. **已配对设备**：每台一行（名字、hostname · OS、在线/最后联系、移除）；请求加入的机器排在前面，一行「<名字> 想加入」加「允许 / 拒绝」。
+3. **附近的中心**：没开中心时列出发现的 Hub（名字 + 地址 + 加入），找不到就给一句「确认两台电脑连的是同一个 Wi-Fi」和重新查找。
+
+配对码、worker 命令和守护命令收在「高级」里，给「页面连不上这个 Hub（防火墙丢了探测）」或「无需界面的机器」用。
+
+它直接走 `/api/bot` 的 `multi-device-*` 端点，不要求用户改 YAML 或手编 `nodes.json`：
+
+- `multi-device-status`（只读）：开关是否可用、是否打开、Hub 状态（`off`/`starting`/`listening`/`failed`）与错误、端口、局域网 URL、DSH Web 的共享地址、已配对节点（名字、在线、OS/架构、hostname、最后联系时间）、**待批的加入请求**、**本机作为节点的状态**（是否已加入、Hub 名、在线、等待中/错误）、只读命令、是否要求审批读取、常驻 worker 的命令。
 - `multi-device-enable`：写 `state.json` 并真正启动/停止 Hub；已加载的 Bot 会话同步拿到或失去设备工具。
+- `multi-device-scan`：UDP 探测一次，返回附近的 Hub（id、名字、URL）。自己这台正在当 Hub 时不列自己。
+- `multi-device-join` / `multi-device-leave`：向 Hub 发加入请求（后台等答案，状态里报 `node.joining`），批准后写 `device.json` 和 `state.json` 并起插件内的 worker；退出则停 worker、删令牌、清状态，原来开着的 Hub 恢复。
+- `multi-device-approve` / `multi-device-deny`：中心那两下按钮；只有「允许」会创建节点和令牌。
 - `multi-device-pair-code`：等价 `device_pairing_code`，返回一次性配对码、过期时间和带当前 Hub URL 的 `npm run lan:worker` 命令；配对码只回到页面，不写团队文件，Hub 的日志也不再携带它。
-- `multi-device-remove`：真正移除节点（同时管理 API 有 `DELETE /admin/nodes/<name|id>`）：断开该节点的流、取消它未完成的任务、删掉令牌散列。那台机器必须重新配对。没有「假按钮」——远程杀不掉对方的 worker 进程，页面明确说需要重新配对。
+- `multi-device-remove`：真正移除节点（同时管理 API 有 `DELETE /admin/nodes/<name|id>`）：断开该节点的流、取消它未完成的任务、删掉令牌散列。那台机器必须重新加入。没有「假按钮」——远程杀不掉对方的 worker 进程，页面明确说需要重新加入。
 
-页面写清只有一个中心：换主设备 = 在另一台打开多机并重新配对；其他机器看同一段对话仍然是浏览器打开本机的 DSH Web。节点在线数也出现在侧栏账号行上方的 Devices 条，点它回到这个页面；`live.multiDevice` 随 state 轮询更新，不另开定时器。
+一个中心：本机加入别人之后就不再当 Hub，退出后再恢复。节点在线数和待批请求数仍然经 `live.multiDevice` 随 state 轮询更新，不另开定时器。
 
 ## 配对与令牌
 
@@ -236,41 +258,34 @@ npm run lan:daemon -- uninstall
 |---|---|
 | Hub（插件进程） | `~/.ds-bot/multi-device/nodes.json`、`admin.token`、`hub.json`（CLI 记住的地址）；会话版本只在内存里 |
 | Worker | `device.json`（设备令牌，0600）、`sync/<botId>.json`（会话只读副本，0600，不含令牌） |
+| 节点（从界面加入） | 本机团队 `state.json` 的 `multiDevice.node`（中心的 URL、名字和节点名，用来重启后继续当节点）；令牌仍在 `device.json` |
 
 ## 怎么用
 
 **中心机器（Mac）**
 
-打开 **Settings → Devices**，拨开 “Enable multi-device on this computer”，确认 Hub 一行显示 Listening，并复制它的局域网地址。点 **Add machine** 会给出一次性配对码和另一台机器要跑的命令；也可以继续用 CLI 看状态：
+打开 **Settings → Devices**，拨开「让这台电脑当中心」，确认一行显示 Listening。
+
+**另一台机器（Windows，装好的 DS Bot）**
+
+1. 打开 **Settings → Devices**，在「附近的中心」里看见中心（同一 Wi-Fi），点 **加入**。
+2. 中心那台弹出一行「windows-pc 想加入」，点 **允许**。
+3. 节点那一行变成「已加入 <中心名> · 在线」；中心的「已配对设备」出现 `windows-pc`（在线）。
+
+之后节点由它自己的插件进程维持 worker：断线、重启都用 `device.json` 自动重连（约 1–2 秒内追平中心对话）。要离开就点 **退出**。
+
+**没有界面的机器（只有 Node）**
+
+页面连不上（例如防火墙丢了 UDP 探测）时，用「高级」里的配对码，或直接用 CLI：
 
 ```sh
 cd ds-bot
-npm run lan:nodes
-npm run lan:run -- --node windows-pc -- hostname
-```
-
-也可以让 Bot 在聊天里加一台机器；它调用 `device_pairing_code`，给出同样的配对码和命令。profile 里的 `multiDevice: true` 只是让这台机器第一次就打开多机；用户在页面上关掉后，以 `state.json` 里的选择为准。
-
-**另一台机器（Windows）**
-
-```powershell
-cd ds-bot
 npm run lan:worker -- --hub http://192.168.1.23:8787 --code 123456 --name windows-pc
-```
-
-`lan:worker` 默认用 `--sync main` 跟随中心的主 Bot：连上后开始把最新一段对话拉进 `%USERPROFILE%\.ds-bot\multi-device\sync\`。只跑任务、不同步会话时加 `--no-sync`；要跟别的 Bot 用 `--sync <botId|名字>`。
-
-第一次配对后令牌写在 `%USERPROFILE%\.ds-bot\multi-device\device.json`，以后不再需要 `--code`。之后让它常驻（安装命令默认带 `--sync main`）：
-
-```powershell
-npm run lan:daemon -- install --hub http://192.168.1.23:8787 --name windows-pc
-```
-
-在那台机器上直接说一句话（同样经 Hub 写进中心的 Session）：
-
-```powershell
+npm run lan:daemon -- install --hub http://192.168.1.23:8787 --name windows-pc   # 常驻
 npm run lan:say -- --text "从 Windows 发一句" --hub http://192.168.1.23:8787
 ```
+
+`lan:worker` 默认用 `--sync main` 跟随中心的主 Bot：连上后开始把最新一段对话拉进 `%USERPROFILE%\.ds-bot\multi-device\sync\`。只跑任务、不同步会话时加 `--no-sync`；要跟别的 Bot 用 `--sync <botId|名字>`。第一次配对后令牌写 `device.json`，以后不再需要 `--code`。中心侧仍可用 `npm run lan:nodes`、`npm run lan:run -- --node windows-pc -- hostname` 排查。
 
 **让 Bot 用它**
 
@@ -298,6 +313,7 @@ Bot 会 `device_transfer`：先 `put`（审批卡），需要时再 `get` 回来
 - **审批是工具侧的门，不是节点的沙箱。** 用户允许一次写入后，worker 会照做；只读命令也能读到机器上的文件（`ls`、`read_file`）。给不可信节点配对前先想清楚。
 - **所有 Bot 都能用这些工具**，目前没有按 Bot 的节点权限。团队里的 Bot 共享同一个 Hub。
 - **设备令牌同时能读会话、能以用户身份发言。** `/session` 的快照里有这段对话，`POST /session` 写进的是用户消息；配对一台机器就等于把这段对话的读写交给它。只在可信局域网里配对。
+- **发现只回答「这里有一个中心」。** 探测和回复里没有令牌、配对码或机器清单；回复里的名字和端口只用来填「附近的中心」那一行。加入请求本身也不配对：谁允许，谁决定。
 - **配对码是一次性短秘密。** 它只应在用户明确要求加机器时生成，并只出现在聊天里；不要写进文件、日志或公开 issue。
 - **节点不需要入站端口。** Worker 主动外连，Windows 防火墙不用放行；中心需要放行 8787/TCP。
 
@@ -411,4 +427,5 @@ node dev/lan-sync-accept.mjs status | stop
 - 2026-11-08：验收自动化 `dev/lan-sync-accept.mjs`（两个客户端读同一 Session 的双向证据、插件 Hub 上的配对/选机/`hostname`、证据 JSON 与 Windows 剩余清单）。
 - 2026-11-08：客户端 Settings → Devices（开关落 `state.json`、Hub 状态与地址、节点列表、配对码与命令、真正移除节点），profile 改为只提供首次默认值。
 - 2026-11-08：v2 六条（任务 `kind` 与读写文件/传输、平台守护安装、侧栏设备条、审批门槛、路径与 OS 选机、共享地址复制与回环降级）。单测覆盖协议、路径逃逸、大小上限、审批前不派单、守护文件内容与选机纯函数。
+- 2026-11-08：v4 配对不再依赖命令行：UDP 发现（8789）、待批的加入请求与中心页面的「允许/拒绝」、安装版节点在插件进程里跑 worker、Devices 页精简为「这台电脑 / 已配对设备 / 附近的中心」，命令收进高级。
 - 2026-11-08：v3 中心权威间歇同步（Hub 的 `/session` 拉取与推送、`epoch`+`revision` 游标、节点只读副本、断线补拉、`lan:say`、`--sync` 与守护命令默认同步、`dev/lan-sync-accept.mjs sync` 验收）。旧的“浏览器打开同一 Web 页”保留为完整界面，不再当作配对节点之间的同步协议。
