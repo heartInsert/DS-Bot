@@ -11,7 +11,9 @@
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { MarkdownText } from './dsh-primitives.js'
 import { CloseIcon } from './icons.js'
-import { SettledQuestion, AnsweredCell } from './questions.js'
+import { SettledQuestion, PendingQuestion } from './questions.js'
+import { AnsweredReply, WidgetCell, PendingView } from './widget-cell.js'
+import { ApprovalCard } from './approval-queue.js'
 import { t } from './i18n.js'
 
 const POLL_MS = 1000
@@ -46,10 +48,11 @@ export function applyHubReply(view, reply) {
   const cursor = typeof reply?.epoch === 'string' ? { epoch: reply.epoch, revision: reply.revision } : null
   const earlier = reply?.earlier ?? null
   const offline = reply?.offline === true
+  const cards = { approvals: Array.isArray(reply?.approvals) ? reply.approvals : [], ...(reply?.question === undefined ? {} : { question: reply.question }), ...(reply?.view === undefined ? {} : { view: reply.view }) }
   if (reply?.unchanged === true) {
-    return { view: { ...(view ?? { items: [] }), offline, earlier: view?.earlier ?? earlier }, cursor }
+    return { view: { ...(view ?? { items: [] }), offline, earlier: view?.earlier ?? earlier, ...cards }, cursor }
   }
-  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [], earlier }, cursor }
+  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [], earlier, ...cards }, cursor }
 }
 
 // Prepend an earlier page to the held items, de-duped by the stable id every item
@@ -79,18 +82,43 @@ function Text({ text }) {
   return h(MarkdownText, { text: String(text ?? ''), variant: 'compact', labels: mdLabels() })
 }
 
+// A group round's non-message row, read-only: the same event text the live group chat
+// draws for a reply, without the click that opens member details or the approval card.
+function relayLabel(reply) {
+  const name = reply?.name ?? reply?.botId ?? 'Bot'
+  switch (reply?.kind) {
+    case 'failed': return t('{name} stopped: {reason}. Switch its model or ask it to go on.', { name, reason: reply.text ?? reply.code ?? '' })
+    case 'lookup': return reply.text ? t('{name} looked up its own chat for “{text}”', { name, text: reply.text }) : t('{name} looked up its own chat', { name })
+    case 'missed': return t("{name} didn't answer in time", { name })
+    case 'admin-passed': return t('{name} did not answer or call anyone; call a member with @Name', { name })
+    case 'paused': return reply.idle
+      ? t('{names} went back and forth {count} times without progress and paused. Write here to go on', { count: reply.count, names: [name, ...(reply.names ?? [])].join(t(' and ')) })
+      : t('Paused after {count} Bot relays. Waiting: {names}', { count: reply.count, names: (reply.names ?? []).join(t(' and ')) })
+    case 'resumed': return t('{name} was cut off by a restart and picked its work back up', { name })
+    case 'cut': return t('{name} was cut off by a restart again and stopped', { name })
+    case 'approval': return t('{name} paused for your approval', { name })
+    case 'working': return t('{name} started on it', { name })
+    case 'folder': return reply.text ?? ''
+    case 'stopped': return t("You stopped {name}'s work", { name })
+    case 'done': return t('{name} finished its work', { name })
+    default: return null
+  }
+}
+
 // A conversation item the hub served: a user message, a Bot reply, a group post, an
-// event line or a divider. Rendered with the same markdown helper the live view uses.
-// Settled question and view cards are drawn with the same read-only components the
-// main conversation uses for history; the live approval card is not in the snapshot
-// (it lives in the hub's work state) and stays a gap for now.
+// event line or a divider. Settled question, view and answer cards reuse the same
+// components the main conversation draws for history; the live cards (approvals,
+// pending question, pending view) ride the snapshot beside the items, not inside them.
 function Row({ item }) {
   const kind = item?.kind
   if (kind === 'divider') {
     return h('div', { className: 'bt-hub-divider' }, item.time ? new Date(item.time).toLocaleTimeString() : '')
   }
   if (kind === 'event') {
-    return h('div', { className: 'bt-hub-event' }, `${item.role ?? ''} · ${item.name ?? ''}`.trim())
+    const name = item.name ?? 'Bot'
+    if (item.role === 'report') return h('div', { className: 'bt-hub-event' }, `${t('Replies from')} ${t('a group chat')}`)
+    const prefix = { stopped: t('Stopped by'), reply: t('Reply from') }[item.role] ?? t('Message from')
+    return h('div', { className: 'bt-hub-event' }, `${prefix} ${name}`)
   }
   if (kind === 'post') {
     const texts = Array.isArray(item.texts) && item.texts.length > 0 ? item.texts : [item.text]
@@ -106,10 +134,18 @@ function Row({ item }) {
     return h('div', { className: 'bt-hub-row bt-hub-user', 'data-pending': item.pending === true || undefined },
       h('div', { className: 'bt-hub-bubble' }, h(Text, { text: item.text })))
   }
-  // A question answered by a message, or a view/handoff answer whose reply text is the
-  // settled card. The same component the history view draws for a settled answer.
+  // A group round's event line, drawn like the main group conversation reads it.
+  if (kind === 'relay') {
+    const label = relayLabel(item.reply)
+    return label === null ? null : h('div', { className: 'bt-hub-event' }, label)
+  }
+  // A question, view or handoff answered by a message: the settled card, read-only.
   if (kind === 'answer') {
-    return h(AnsweredCell, { node: { data: item } })
+    return h(AnsweredReply, { node: { data: item } })
+  }
+  // A display-only show_view replays from the blueprint the host kept on the call.
+  if (kind === 'view') {
+    return h(WidgetCell, { callId: item.callId, args: { text: name => name === 'title' ? item.title : undefined, value: name => name === 'view' ? item.view : undefined }, done: true, isError: false, roster: {}, actions: {} })
   }
   // A question or view card closed without an answer on it: the settled card, read-only.
   if (kind === 'closed') {
@@ -130,6 +166,9 @@ export function HubChat({ id, kind, name, left, actions }) {
   const [loadingEarlier, setLoadingEarlier] = useState(false)
   const [error, setError] = useState(null)
   const [pending, setPending] = useState(null)
+  // An approval the hub no longer holds (answered elsewhere, expired): its card stays
+  // here with the reason instead of being answered, so a stale answer reads clearly.
+  const [approvalErrors, setApprovalErrors] = useState({})
   // The replica's cursor, sent back so an unchanged poll answers without the item list.
   const cursorRef = useRef(null)
   // The view the last apply produced, kept beside the state so a reply applies against
@@ -216,6 +255,48 @@ export function HubChat({ id, kind, name, left, actions }) {
   const items = hubRows(view?.items, sending ? pending : null)
   const offline = view?.offline === true
 
+  // The pending card's answer forwards through the hub, never against this node's own
+  // (empty) Session: the node relays and the hub resolves, idempotently by card id.
+  const cardActions = {
+    answerApproval: (approvalId, choice) => actions.hubApprovalAnswer(approvalId, choice),
+    reportApprovalFailure: (approval, failure) => setApprovalErrors(current => ({ ...current, [approval.id]: failure?.message ?? String(failure) })),
+    dismissApproval: approval => setApprovalErrors(current => {
+      const next = { ...current }
+      delete next[approval.id]
+      return next
+    }),
+    answerQuestion: (_sessionId, questionId, answer) => actions.hubQuestionAnswer(id, kind, questionId, answer),
+    dismissQuestion: () => actions.hubQuestionDismiss(id, kind),
+    answerView: (_sessionId, viewId, action, values) => actions.hubViewAnswer(id, kind, viewId, action, values),
+    dismissView: () => actions.hubViewDismiss(id, kind),
+    noteHeldCard: () => {},
+  }
+
+  const cards = [
+    ...(view?.approvals ?? []).map(approval => h(ApprovalCard, {
+      key: `approval-${approval.id}`,
+      approval,
+      bot: { id: approval.botId, name: approval.botName ?? 'Bot', color: 'gray' },
+      actions: cardActions,
+      error: approvalErrors[approval.id],
+    })),
+    ...(view?.question === undefined ? [] : [h(PendingQuestion, {
+      key: `question-${view.question.id}`,
+      sessionId: id,
+      question: view.question,
+      actions: cardActions,
+      inline: true,
+      enterToSend: true,
+    })]),
+    ...(view?.view === undefined ? [] : [h(PendingView, {
+      key: `view-${view.view.id}`,
+      sessionId: id,
+      view: view.view,
+      actions: cardActions,
+      inline: true,
+    })]),
+  ]
+
   return h('div', { className: 'bt-hub', role: 'region', 'aria-label': t('Hub conversation'), style: { '--bt-hub-left': `${left}px` } },
     h('div', { className: 'bt-hub-head' },
       h('div', { className: 'bt-hub-title' },
@@ -228,7 +309,8 @@ export function HubChat({ id, kind, name, left, actions }) {
         h('button', { type: 'button', className: 'bt-hub-earlier-btn', disabled: loadingEarlier, onClick: loadEarlier }, loadingEarlier ? '…' : t('Load earlier'))) : null,
       error === null ? null : h('div', { className: 'bt-hub-error' }, error),
       offline && items.length === 0 ? h('div', { className: 'bt-hub-empty' }, t('This computer is not connected to the hub.')) : null,
-      items.map((item, index) => h(Row, { key: itemKey(item, index), item }))),
+      items.map((item, index) => h(Row, { key: itemKey(item, index), item })),
+      cards.length === 0 ? null : h('div', { className: 'bt-hub-cards' }, cards)),
     h('div', { className: 'bt-hub-composer' },
       h('textarea', {
         className: 'bt-hub-input',
@@ -267,6 +349,7 @@ export const HUB_CHAT_CSS = `
 .bt-hub-divider{align-self:center;font-size:11px;color:var(--bt-ink-3)}
 .bt-hub-event{align-self:center;font-size:12px;color:var(--bt-ink-2)}
 .bt-hub-card{flex:none;width:100%}
+.bt-hub-cards{display:flex;flex-direction:column;gap:8px;flex:none}
 .bt-hub-earlier{align-self:center;flex:none}
 .bt-hub-earlier-btn{padding:6px 14px;border-radius:999px;border:0;background:var(--bt-hover);color:var(--bt-ink-2);font:inherit;font-size:12px;cursor:pointer}
 .bt-hub-earlier-btn:hover{background:var(--bt-active);color:var(--bt-ink)}

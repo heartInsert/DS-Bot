@@ -25888,8 +25888,140 @@ var BROWSER_CSS = `
 @media (prefers-reduced-motion:reduce){.bt-ptabs,.bt-panel-view,.bt-bcard,.bt-ptab-name{animation:none}}
 `;
 
-// src/client/hub-chat.js
+// src/client/approval-queue.js
 var import_react60 = require("react");
+var NO_WORK2 = { approvals: [] };
+function approvalsOf(work, chat) {
+  return (work?.approvals ?? NO_WORK2.approvals).filter((entry) => approvalChat(entry) === chat).sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+}
+function closedApprovals(state, chat, pending = []) {
+  return Object.values(state?.closed?.[chat] ?? {}).filter((entry) => !pending.some((open) => open.id === entry.approval.id)).sort((a, b) => a.at - b.at);
+}
+var APPROVAL_STALE = "This approval is no longer open";
+function vanishedApprovals(prev, next) {
+  const open = new Set((next?.approvals ?? []).map((entry) => entry.id));
+  return (prev?.approvals ?? []).filter((entry) => !open.has(entry.id));
+}
+function closeVanishedApprovals(state, prev, next, { at = Date.now(), message = APPROVAL_STALE } = {}) {
+  const vanished = vanishedApprovals(prev, next);
+  if (vanished.length === 0) return state;
+  const settled = { ...state?.settled ?? {} };
+  const closed = { ...state?.closed ?? {} };
+  let changed = false;
+  for (const entry of vanished) {
+    if (settled[entry.id] === true) {
+      delete settled[entry.id];
+      changed = true;
+      continue;
+    }
+    const chat = approvalChat(entry);
+    if (closed[chat]?.[entry.id] !== void 0) continue;
+    closed[chat] = { ...closed[chat] ?? {}, [entry.id]: { approval: entry, message, at } };
+    changed = true;
+  }
+  return changed ? { ...state, closed, settled } : state;
+}
+function waitingIn(work, state, chat) {
+  const pending = approvalsOf(work, chat);
+  return pending.length > 0 || closedApprovals(state, chat, pending).length > 0;
+}
+function approvalCellWanted(roster, work, state, sessionId) {
+  if (sessionId === void 0) return false;
+  if (roster?.roomsById?.[sessionId] !== void 0) return false;
+  if (roster?.questions?.[sessionId] !== void 0) return false;
+  return waitingIn(work, state, sessionId);
+}
+var approvalCellKey = (work, state) => JSON.stringify([
+  (work?.approvals ?? []).map((entry) => entry.id),
+  Object.entries(state?.closed ?? {}).map(([chat, cards]) => [chat, Object.keys(cards)]).sort()
+]);
+function ApprovalCard2({ approval, bot, actions, error }) {
+  const [busy, setBusy] = (0, import_react60.useState)(false);
+  const [answered, setAnswered] = (0, import_react60.useState)(null);
+  const answer = (choice) => {
+    if (busy) return;
+    setBusy(true);
+    void Promise.resolve(actions.answerApproval(approval.id, choice)).then(() => setAnswered(choice)).catch((failure) => actions.reportApprovalFailure(approval, failure)).finally(() => setBusy(false));
+  };
+  const waiting = t("{name} is waiting for your approval", { name: bot?.name ?? t("A Bot") });
+  return (0, import_react60.createElement)(
+    "div",
+    { className: "bt-aq-card", role: "group", "aria-label": error ?? waiting },
+    (0, import_react60.createElement)(
+      "div",
+      { className: "bt-aq-head" },
+      bot ? (0, import_react60.createElement)(BotMark, { bot, size: 18, state: error ? "idle" : "alert" }) : null,
+      (0, import_react60.createElement)("span", { className: "bt-aq-name" }, bot?.name ?? t("A Bot")),
+      approval.tool ? (0, import_react60.createElement)("span", { className: "bt-aq-tool" }, approval.tool) : null
+    ),
+    approval.detail?.text ? (0, import_react60.createElement)("div", { className: "bt-aq-text" }, approval.detail.text) : null,
+    approval.reason ? (0, import_react60.createElement)("div", { className: "bt-aq-reason" }, approval.reason) : null,
+    approval.detail?.code ? (0, import_react60.createElement)("code", { className: "bt-aq-code", title: approval.detail.code }, approval.detail.code) : null,
+    error ? (0, import_react60.createElement)(
+      "div",
+      { className: "bt-aq-closed" },
+      (0, import_react60.createElement)("span", { className: "bt-aq-error", role: "alert" }, error),
+      (0, import_react60.createElement)("button", { type: "button", className: "bt-aq-btn", onClick: () => actions.dismissApproval(approval) }, t("Dismiss"))
+    ) : answered ? (0, import_react60.createElement)("div", { className: "bt-aq-done", role: "status" }, t(answered === "allow" ? "Allowed" : "Rejected")) : (0, import_react60.createElement)(
+      "div",
+      { className: "bt-aq-actions" },
+      (0, import_react60.createElement)("button", { type: "button", className: "bt-aq-btn", disabled: busy, onClick: () => answer("reject") }, t("Reject")),
+      (0, import_react60.createElement)("button", { type: "button", className: "bt-aq-go", disabled: busy, onClick: () => answer("allow") }, t("Allow once"))
+    )
+  );
+}
+function ApprovalQueue({ sessionId, cell, useWork, useApprovals, useRoster, actions }) {
+  const roster = useRoster((value) => value);
+  const work = useWork((value) => value ?? NO_WORK2);
+  const state = useApprovals((value) => value);
+  const room2 = roster.roomsById?.[sessionId];
+  const chat = room2 ? room2.id : sessionId;
+  const pending = approvalsOf(work, chat);
+  const closed = closedApprovals(state, chat, pending);
+  if (pending.length === 0 && closed.length === 0) return null;
+  const count = pending.length;
+  const many = count > 1 ? t("{count} waiting for approval", { count }) : null;
+  const label = count === 1 ? t("{name} is waiting for your approval", { name: roster.byId[pending[0].botId]?.name ?? t("A Bot") }) : many;
+  return (0, import_react60.createElement)(
+    "div",
+    { className: "bt-aq", "data-cell": cell || void 0, "data-count": count, role: "group", "aria-label": label },
+    many ? (0, import_react60.createElement)("div", { className: "bt-aq-count" }, many) : null,
+    pending.map((approval) => (0, import_react60.createElement)(ApprovalCard2, { key: approval.id, approval, bot: roster.byId[approval.botId], actions })),
+    closed.map((entry) => (0, import_react60.createElement)(ApprovalCard2, { key: entry.approval.id, approval: entry.approval, bot: roster.byId[entry.approval.botId], actions, error: entry.message }))
+  );
+}
+function ApprovalCell(props) {
+  return (0, import_react60.createElement)(ApprovalQueue, { ...props, cell: true });
+}
+function ApprovalDock(props) {
+  const roster = props.useRoster((value) => value);
+  if (roster.roomsById?.[props.sessionId] === void 0) return null;
+  return (0, import_react60.createElement)(ApprovalQueue, props);
+}
+var APPROVAL_CSS = `
+.bt-aq{display:flex;flex-direction:column;gap:6px;box-sizing:border-box;width:calc(100% - var(--dsh-composer-side-clearance,0px) - var(--dsh-composer-side-clearance,0px) - var(--dsh-composer-dock-inset,0px) - var(--dsh-composer-dock-inset,0px));max-width:calc(var(--dsh-composer-card-max-width,748px) - var(--dsh-composer-dock-inset,0px) - var(--dsh-composer-dock-inset,0px));margin:0 auto 8px;padding:0 var(--dsh-composer-dock-inset,0px);flex:none}
+.bt-aq[data-cell]{width:auto;max-width:var(--dsh-chat-content-width,748px);margin:0 auto;padding:8px calc(var(--dsh-composer-side-clearance,0px) + 16px) 12px}
+.bt-aq-count{padding:0 2px;font-size:12px;line-height:16px;color:var(--bt-ink-3)}
+.bt-aq-card{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:12px;background:var(--bt-hover);font-size:12px;line-height:17px;color:var(--bt-ink-2);animation:bt-rise .2s ease-out backwards}
+.bt-aq-head{display:flex;align-items:center;gap:6px;min-width:0;font-weight:600;color:var(--bt-ink)}
+.bt-aq-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bt-aq-tool{flex:none;font-weight:400;color:var(--bt-ink-3);font:11px/16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.bt-aq-text{color:var(--bt-ink);overflow-wrap:anywhere}
+.bt-aq-reason{overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.bt-aq-code{display:block;padding:4px 8px;border-radius:6px;background:var(--bt-main);font:11px/16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--bt-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bt-aq-actions,.bt-aq-closed{display:flex;align-items:center;justify-content:flex-end;gap:6px;margin-top:4px}
+.bt-aq-error{flex:1;min-width:0;color:var(--bt-danger);overflow-wrap:anywhere}
+.bt-aq-done{margin-top:4px;text-align:right;color:var(--bt-ink-3)}
+.bt-aq-btn,.bt-aq-go{height:28px;padding:0 12px;border:0;border-radius:999px;font:inherit;font-size:12px;cursor:pointer}
+.bt-aq-btn{background:var(--bt-main);box-shadow:inset 0 0 0 .5px var(--bt-line-2);color:var(--bt-ink-2)}
+.bt-aq-btn:hover{background:var(--bt-active);color:var(--bt-ink)}
+.bt-aq-go{background:var(--bt-ink);color:var(--bt-main)}
+.bt-aq-btn:disabled,.bt-aq-go:disabled{opacity:.5;cursor:default}
+@media (prefers-reduced-motion:reduce){.bt-aq-card{animation:none}}
+`;
+
+// src/client/hub-chat.js
+var import_react61 = require("react");
 var POLL_MS4 = 1e3;
 var messageSeq = 0;
 var newMessageId = () => `msg-${messageSeq += 1}-${Math.random().toString(36).slice(2, 8)}`;
@@ -25907,10 +26039,11 @@ function applyHubReply(view, reply) {
   const cursor = typeof reply?.epoch === "string" ? { epoch: reply.epoch, revision: reply.revision } : null;
   const earlier = reply?.earlier ?? null;
   const offline = reply?.offline === true;
+  const cards = { approvals: Array.isArray(reply?.approvals) ? reply.approvals : [], ...reply?.question === void 0 ? {} : { question: reply.question }, ...reply?.view === void 0 ? {} : { view: reply.view } };
   if (reply?.unchanged === true) {
-    return { view: { ...view ?? { items: [] }, offline, earlier: view?.earlier ?? earlier }, cursor };
+    return { view: { ...view ?? { items: [] }, offline, earlier: view?.earlier ?? earlier, ...cards }, cursor };
   }
-  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [], earlier }, cursor };
+  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [], earlier, ...cards }, cursor };
 }
 function prependEarlier(items, earlierItems) {
   const current = Array.isArray(items) ? items : [];
@@ -25932,64 +26065,106 @@ function prependEarlier(items, earlierItems) {
   return out;
 }
 function Text({ text }) {
-  return (0, import_react60.createElement)(import_dsh_client_ui_primitives.MarkdownText, { text: String(text ?? ""), variant: "compact", labels: mdLabels4() });
+  return (0, import_react61.createElement)(import_dsh_client_ui_primitives.MarkdownText, { text: String(text ?? ""), variant: "compact", labels: mdLabels4() });
+}
+function relayLabel(reply) {
+  const name = reply?.name ?? reply?.botId ?? "Bot";
+  switch (reply?.kind) {
+    case "failed":
+      return t("{name} stopped: {reason}. Switch its model or ask it to go on.", { name, reason: reply.text ?? reply.code ?? "" });
+    case "lookup":
+      return reply.text ? t("{name} looked up its own chat for “{text}”", { name, text: reply.text }) : t("{name} looked up its own chat", { name });
+    case "missed":
+      return t("{name} didn't answer in time", { name });
+    case "admin-passed":
+      return t("{name} did not answer or call anyone; call a member with @Name", { name });
+    case "paused":
+      return reply.idle ? t("{names} went back and forth {count} times without progress and paused. Write here to go on", { count: reply.count, names: [name, ...reply.names ?? []].join(t(" and ")) }) : t("Paused after {count} Bot relays. Waiting: {names}", { count: reply.count, names: (reply.names ?? []).join(t(" and ")) });
+    case "resumed":
+      return t("{name} was cut off by a restart and picked its work back up", { name });
+    case "cut":
+      return t("{name} was cut off by a restart again and stopped", { name });
+    case "approval":
+      return t("{name} paused for your approval", { name });
+    case "working":
+      return t("{name} started on it", { name });
+    case "folder":
+      return reply.text ?? "";
+    case "stopped":
+      return t("You stopped {name}'s work", { name });
+    case "done":
+      return t("{name} finished its work", { name });
+    default:
+      return null;
+  }
 }
 function Row4({ item }) {
   const kind = item?.kind;
   if (kind === "divider") {
-    return (0, import_react60.createElement)("div", { className: "bt-hub-divider" }, item.time ? new Date(item.time).toLocaleTimeString() : "");
+    return (0, import_react61.createElement)("div", { className: "bt-hub-divider" }, item.time ? new Date(item.time).toLocaleTimeString() : "");
   }
   if (kind === "event") {
-    return (0, import_react60.createElement)("div", { className: "bt-hub-event" }, `${item.role ?? ""} · ${item.name ?? ""}`.trim());
+    const name = item.name ?? "Bot";
+    if (item.role === "report") return (0, import_react61.createElement)("div", { className: "bt-hub-event" }, `${t("Replies from")} ${t("a group chat")}`);
+    const prefix = { stopped: t("Stopped by"), reply: t("Reply from") }[item.role] ?? t("Message from");
+    return (0, import_react61.createElement)("div", { className: "bt-hub-event" }, `${prefix} ${name}`);
   }
   if (kind === "post") {
     const texts2 = Array.isArray(item.texts) && item.texts.length > 0 ? item.texts : [item.text];
-    return (0, import_react60.createElement)(
+    return (0, import_react61.createElement)(
       "div",
       { className: "bt-hub-row bt-hub-bot" },
-      (0, import_react60.createElement)("div", { className: "bt-hub-who" }, item.name ?? "Bot"),
-      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, texts2.map((text, index) => (0, import_react60.createElement)(Text, { key: index, text })))
+      (0, import_react61.createElement)("div", { className: "bt-hub-who" }, item.name ?? "Bot"),
+      (0, import_react61.createElement)("div", { className: "bt-hub-bubble" }, texts2.map((text, index) => (0, import_react61.createElement)(Text, { key: index, text })))
     );
   }
   if (kind === "bot") {
-    return (0, import_react60.createElement)(
+    return (0, import_react61.createElement)(
       "div",
       { className: "bt-hub-row bt-hub-bot" },
-      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react60.createElement)(Text, { text: item.text }))
+      (0, import_react61.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react61.createElement)(Text, { text: item.text }))
     );
   }
   if (kind === "user") {
-    return (0, import_react60.createElement)(
+    return (0, import_react61.createElement)(
       "div",
       { className: "bt-hub-row bt-hub-user", "data-pending": item.pending === true || void 0 },
-      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react60.createElement)(Text, { text: item.text }))
+      (0, import_react61.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react61.createElement)(Text, { text: item.text }))
     );
   }
+  if (kind === "relay") {
+    const label = relayLabel(item.reply);
+    return label === null ? null : (0, import_react61.createElement)("div", { className: "bt-hub-event" }, label);
+  }
   if (kind === "answer") {
-    return (0, import_react60.createElement)(AnsweredCell, { node: { data: item } });
+    return (0, import_react61.createElement)(AnsweredReply, { node: { data: item } });
+  }
+  if (kind === "view") {
+    return (0, import_react61.createElement)(WidgetCell, { callId: item.callId, args: { text: (name) => name === "title" ? item.title : void 0, value: (name) => name === "view" ? item.view : void 0 }, done: true, isError: false, roster: {}, actions: {} });
   }
   if (kind === "closed") {
     if (item.question !== void 0) {
-      return (0, import_react60.createElement)("div", { className: "bt-hub-card" }, (0, import_react60.createElement)(SettledQuestion, { question: item.question, closed: item.closed }));
+      return (0, import_react61.createElement)("div", { className: "bt-hub-card" }, (0, import_react61.createElement)(SettledQuestion, { question: item.question, closed: item.closed }));
     }
     if (item.view !== void 0) {
-      return (0, import_react60.createElement)("div", { className: "bt-hub-card" }, (0, import_react60.createElement)(SettledQuestion, { question: { question: item.title || t("View") }, closed: item.closed }));
+      return (0, import_react61.createElement)("div", { className: "bt-hub-card" }, (0, import_react61.createElement)(SettledQuestion, { question: { question: item.title || t("View") }, closed: item.closed }));
     }
   }
   return null;
 }
 function HubChat({ id, kind, name, left, actions }) {
-  const [view, setView] = (0, import_react60.useState)(null);
-  const [text, setText] = (0, import_react60.useState)("");
-  const [sending, setSending] = (0, import_react60.useState)(false);
-  const [loadingEarlier, setLoadingEarlier] = (0, import_react60.useState)(false);
-  const [error, setError] = (0, import_react60.useState)(null);
-  const [pending, setPending] = (0, import_react60.useState)(null);
-  const cursorRef = (0, import_react60.useRef)(null);
-  const viewRef = (0, import_react60.useRef)(null);
-  const listRef = (0, import_react60.useRef)(null);
-  const anchorRef = (0, import_react60.useRef)(null);
-  const refresh = (0, import_react60.useCallback)(() => {
+  const [view, setView] = (0, import_react61.useState)(null);
+  const [text, setText] = (0, import_react61.useState)("");
+  const [sending, setSending] = (0, import_react61.useState)(false);
+  const [loadingEarlier, setLoadingEarlier] = (0, import_react61.useState)(false);
+  const [error, setError] = (0, import_react61.useState)(null);
+  const [pending, setPending] = (0, import_react61.useState)(null);
+  const [approvalErrors, setApprovalErrors] = (0, import_react61.useState)({});
+  const cursorRef = (0, import_react61.useRef)(null);
+  const viewRef = (0, import_react61.useRef)(null);
+  const listRef = (0, import_react61.useRef)(null);
+  const anchorRef = (0, import_react61.useRef)(null);
+  const refresh = (0, import_react61.useCallback)(() => {
     const cursor = cursorRef.current;
     void Promise.resolve(actions.hubChat(id, kind, cursor)).then((reply) => {
       const next = applyHubReply(viewRef.current, reply);
@@ -26002,12 +26177,12 @@ function HubChat({ id, kind, name, left, actions }) {
       setView(offline2);
     });
   }, [id, kind, actions]);
-  (0, import_react60.useEffect)(() => {
+  (0, import_react61.useEffect)(() => {
     refresh();
     const timer = setInterval(refresh, POLL_MS4);
     return () => clearInterval(timer);
   }, [refresh]);
-  (0, import_react60.useEffect)(() => {
+  (0, import_react61.useEffect)(() => {
     const list = listRef.current;
     if (list === null) return;
     if (anchorRef.current !== null) {
@@ -26055,37 +26230,77 @@ function HubChat({ id, kind, name, left, actions }) {
   };
   const items = hubRows(view?.items, sending ? pending : null);
   const offline = view?.offline === true;
-  return (0, import_react60.createElement)(
+  const cardActions = {
+    answerApproval: (approvalId, choice) => actions.hubApprovalAnswer(approvalId, choice),
+    reportApprovalFailure: (approval, failure) => setApprovalErrors((current) => ({ ...current, [approval.id]: failure?.message ?? String(failure) })),
+    dismissApproval: (approval) => setApprovalErrors((current) => {
+      const next = { ...current };
+      delete next[approval.id];
+      return next;
+    }),
+    answerQuestion: (_sessionId, questionId, answer) => actions.hubQuestionAnswer(id, kind, questionId, answer),
+    dismissQuestion: () => actions.hubQuestionDismiss(id, kind),
+    answerView: (_sessionId, viewId, action, values) => actions.hubViewAnswer(id, kind, viewId, action, values),
+    dismissView: () => actions.hubViewDismiss(id, kind),
+    noteHeldCard: () => {
+    }
+  };
+  const cards = [
+    ...(view?.approvals ?? []).map((approval) => (0, import_react61.createElement)(ApprovalCard2, {
+      key: `approval-${approval.id}`,
+      approval,
+      bot: { id: approval.botId, name: approval.botName ?? "Bot", color: "gray" },
+      actions: cardActions,
+      error: approvalErrors[approval.id]
+    })),
+    ...view?.question === void 0 ? [] : [(0, import_react61.createElement)(PendingQuestion, {
+      key: `question-${view.question.id}`,
+      sessionId: id,
+      question: view.question,
+      actions: cardActions,
+      inline: true,
+      enterToSend: true
+    })],
+    ...view?.view === void 0 ? [] : [(0, import_react61.createElement)(PendingView, {
+      key: `view-${view.view.id}`,
+      sessionId: id,
+      view: view.view,
+      actions: cardActions,
+      inline: true
+    })]
+  ];
+  return (0, import_react61.createElement)(
     "div",
     { className: "bt-hub", role: "region", "aria-label": t("Hub conversation"), style: { "--bt-hub-left": `${left}px` } },
-    (0, import_react60.createElement)(
+    (0, import_react61.createElement)(
       "div",
       { className: "bt-hub-head" },
-      (0, import_react60.createElement)(
+      (0, import_react61.createElement)(
         "div",
         { className: "bt-hub-title" },
-        (0, import_react60.createElement)("span", { className: "bt-hub-name" }, name ?? (kind === "room" ? "Group" : "Bot")),
-        (0, import_react60.createElement)("span", { className: "bt-hub-badge" }, t("Hub"))
+        (0, import_react61.createElement)("span", { className: "bt-hub-name" }, name ?? (kind === "room" ? "Group" : "Bot")),
+        (0, import_react61.createElement)("span", { className: "bt-hub-badge" }, t("Hub"))
       ),
-      offline ? (0, import_react60.createElement)("span", { className: "bt-hub-offline" }, t("Offline — messages are not sent")) : null,
-      (0, import_react60.createElement)("button", { type: "button", className: "bt-hub-close", "aria-label": t("Close"), onClick: () => actions.closeHubChat() }, (0, import_react60.createElement)(CloseIcon))
+      offline ? (0, import_react61.createElement)("span", { className: "bt-hub-offline" }, t("Offline — messages are not sent")) : null,
+      (0, import_react61.createElement)("button", { type: "button", className: "bt-hub-close", "aria-label": t("Close"), onClick: () => actions.closeHubChat() }, (0, import_react61.createElement)(CloseIcon))
     ),
-    (0, import_react60.createElement)(
+    (0, import_react61.createElement)(
       "div",
       { className: "bt-hub-body", ref: listRef },
-      view?.earlier ? (0, import_react60.createElement)(
+      view?.earlier ? (0, import_react61.createElement)(
         "div",
         { className: "bt-hub-earlier" },
-        (0, import_react60.createElement)("button", { type: "button", className: "bt-hub-earlier-btn", disabled: loadingEarlier, onClick: loadEarlier }, loadingEarlier ? "…" : t("Load earlier"))
+        (0, import_react61.createElement)("button", { type: "button", className: "bt-hub-earlier-btn", disabled: loadingEarlier, onClick: loadEarlier }, loadingEarlier ? "…" : t("Load earlier"))
       ) : null,
-      error === null ? null : (0, import_react60.createElement)("div", { className: "bt-hub-error" }, error),
-      offline && items.length === 0 ? (0, import_react60.createElement)("div", { className: "bt-hub-empty" }, t("This computer is not connected to the hub.")) : null,
-      items.map((item, index) => (0, import_react60.createElement)(Row4, { key: itemKey(item, index), item }))
+      error === null ? null : (0, import_react61.createElement)("div", { className: "bt-hub-error" }, error),
+      offline && items.length === 0 ? (0, import_react61.createElement)("div", { className: "bt-hub-empty" }, t("This computer is not connected to the hub.")) : null,
+      items.map((item, index) => (0, import_react61.createElement)(Row4, { key: itemKey(item, index), item })),
+      cards.length === 0 ? null : (0, import_react61.createElement)("div", { className: "bt-hub-cards" }, cards)
     ),
-    (0, import_react60.createElement)(
+    (0, import_react61.createElement)(
       "div",
       { className: "bt-hub-composer" },
-      (0, import_react60.createElement)("textarea", {
+      (0, import_react61.createElement)("textarea", {
         className: "bt-hub-input",
         value: text,
         disabled: offline || sending,
@@ -26099,7 +26314,7 @@ function HubChat({ id, kind, name, left, actions }) {
           }
         }
       }),
-      (0, import_react60.createElement)("button", { type: "button", className: "bt-hub-send", disabled: offline || sending || text.trim() === "", onClick: send }, sending ? "…" : t("Send"))
+      (0, import_react61.createElement)("button", { type: "button", className: "bt-hub-send", disabled: offline || sending || text.trim() === "", onClick: send }, sending ? "…" : t("Send"))
     )
   );
 }
@@ -26123,6 +26338,7 @@ var HUB_CHAT_CSS = `
 .bt-hub-divider{align-self:center;font-size:11px;color:var(--bt-ink-3)}
 .bt-hub-event{align-self:center;font-size:12px;color:var(--bt-ink-2)}
 .bt-hub-card{flex:none;width:100%}
+.bt-hub-cards{display:flex;flex-direction:column;gap:8px;flex:none}
 .bt-hub-earlier{align-self:center;flex:none}
 .bt-hub-earlier-btn{padding:6px 14px;border-radius:999px;border:0;background:var(--bt-hover);color:var(--bt-ink-2);font:inherit;font-size:12px;cursor:pointer}
 .bt-hub-earlier-btn:hover{background:var(--bt-active);color:var(--bt-ink)}
@@ -26136,7 +26352,7 @@ var HUB_CHAT_CSS = `
 `;
 
 // src/client/overlays.js
-var import_react61 = require("react");
+var import_react62 = require("react");
 var import_react_dom10 = require("react-dom");
 var DIALOG_EXIT_MS = 160;
 var MENU_EXIT_MS3 = 120;
@@ -26147,8 +26363,8 @@ function Overlays({ useRoster, useUi, useSessions, useSessionStatus, useActivity
   const frameSnap = useFrame ? useFrame((value) => value) : { viewport: window.innerWidth, sidebarWidth: FALLBACK_SIDEBAR_WIDTH, collapsedWidth: 0 };
   const pref = useSidebarPref ? useSidebarPref((value) => value) : "open";
   const current = useSessions((list) => Object.values(list.byId).find((session) => (session?.retainedBy?.mainView ?? 0) > 0)?.id ?? null);
-  const previous = (0, import_react61.useRef)(current);
-  (0, import_react61.useEffect)(() => {
+  const previous = (0, import_react62.useRef)(current);
+  (0, import_react62.useEffect)(() => {
     if (previous.current === current) return;
     previous.current = current;
     if (current) actions.followPanel?.(current);
@@ -26162,8 +26378,8 @@ function Overlays({ useRoster, useUi, useSessions, useSessionStatus, useActivity
     panel: open ? { view: open.view, yielded: ui2.panelYield === true } : null
   });
   const shown = open !== null && layout.panel !== "folded" ? open : null;
-  const [kept, setKept] = (0, import_react61.useState)(shown);
-  (0, import_react61.useEffect)(() => {
+  const [kept, setKept] = (0, import_react62.useState)(shown);
+  (0, import_react62.useEffect)(() => {
     if (shown) {
       setKept(shown);
       return void 0;
@@ -26182,18 +26398,18 @@ function Overlays({ useRoster, useUi, useSessions, useSessionStatus, useActivity
   const [memory, memoryLeaving] = useLinger(ui2.memory && memoryOwner(ui2.memory) ? ui2.memory : null, DIALOG_EXIT_MS);
   const owner = memory ? memoryOwner(memory) : null;
   const [menu, menuLeaving] = useLinger(ui2.menu, MENU_EXIT_MS3);
-  return (0, import_react61.createElement)(
-    import_react61.Fragment,
+  return (0, import_react62.createElement)(
+    import_react62.Fragment,
     null,
-    pane ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(BotPanel, { pane, leaving: shown === null, room: layout.room, overlay: layout.panel === "overlay", roster, actions, useSessions, useSessionStatus, useActivity, useWork, useBrowserTabs, useBrowserPages, useBrowserHolds }), document.body) : null,
-    ui2.newChat ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(NewChat, { key: ui2.newChat, mode: ui2.newChat, roster, actions }), document.body) : null,
-    ui2.palette ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(CommandPalette, { key: ui2.palette.token, start: ui2.palette.query, token: ui2.palette.token, roster, actions, useSessions }), document.body) : null,
-    ui2.exchange ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(ExchangeDialog, { pair: ui2.exchange, roster, actions }), document.body) : null,
-    ui2.voice ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(VoiceMode, { key: ui2.voice, sessionId: ui2.voice, roster, actions, useSessions, useSessionStatus }), document.body) : null,
-    menu ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(ContextMenu, { key: `${menu.kind ?? ""}:${menu.id}:${menu.x}:${menu.y}`, menu, roster, actions, leaving: menuLeaving }), document.body) : null,
-    settings ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(SettingsDialog, { page: settings.page, id: settings.id, roster, actions, useUpdate, leaving: settingsLeaving }), document.body) : null,
-    owner ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(MemoryDialog, { key: owner.id, owner, actions, leaving: memoryLeaving }), document.body) : null,
-    ui2.hubChat ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(HubChat, { key: ui2.hubChat.id, id: ui2.hubChat.id, kind: ui2.hubChat.kind, name: ui2.hubChat.name, left: conversationLeft({ viewport: frameSnap.viewport, sidebarWidth: frameSnap.sidebarWidth, pref, drawer: ui2.leftDrawer === true }), actions }), document.body) : null
+    pane ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(BotPanel, { pane, leaving: shown === null, room: layout.room, overlay: layout.panel === "overlay", roster, actions, useSessions, useSessionStatus, useActivity, useWork, useBrowserTabs, useBrowserPages, useBrowserHolds }), document.body) : null,
+    ui2.newChat ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(NewChat, { key: ui2.newChat, mode: ui2.newChat, roster, actions }), document.body) : null,
+    ui2.palette ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(CommandPalette, { key: ui2.palette.token, start: ui2.palette.query, token: ui2.palette.token, roster, actions, useSessions }), document.body) : null,
+    ui2.exchange ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(ExchangeDialog, { pair: ui2.exchange, roster, actions }), document.body) : null,
+    ui2.voice ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(VoiceMode, { key: ui2.voice, sessionId: ui2.voice, roster, actions, useSessions, useSessionStatus }), document.body) : null,
+    menu ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(ContextMenu, { key: `${menu.kind ?? ""}:${menu.id}:${menu.x}:${menu.y}`, menu, roster, actions, leaving: menuLeaving }), document.body) : null,
+    settings ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(SettingsDialog, { page: settings.page, id: settings.id, roster, actions, useUpdate, leaving: settingsLeaving }), document.body) : null,
+    owner ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(MemoryDialog, { key: owner.id, owner, actions, leaving: memoryLeaving }), document.body) : null,
+    ui2.hubChat ? (0, import_react_dom10.createPortal)((0, import_react62.createElement)(HubChat, { key: ui2.hubChat.id, id: ui2.hubChat.id, kind: ui2.hubChat.kind, name: ui2.hubChat.name, left: conversationLeft({ viewport: frameSnap.viewport, sidebarWidth: frameSnap.sidebarWidth, pref, drawer: ui2.leftDrawer === true }), actions }), document.body) : null
   );
 }
 
@@ -27253,15 +27469,15 @@ function lineDiff(before, after) {
 }
 
 // src/client/learning-card.js
-var import_react62 = require("react");
+var import_react63 = require("react");
 var failedAnswers = /* @__PURE__ */ new Map();
 function ProposalCard({ proposal, initialError = "", onFailure, onResolved, actions }) {
   const outcome = proposal.outcome;
-  const [busy, setBusy] = (0, import_react62.useState)(false);
-  const [error, setError] = (0, import_react62.useState)(initialError);
-  const [open, setOpen] = (0, import_react62.useState)(false);
-  const busyRef = (0, import_react62.useRef)(false);
-  const titleId = (0, import_react62.useId)();
+  const [busy, setBusy] = (0, import_react63.useState)(false);
+  const [error, setError] = (0, import_react63.useState)(initialError);
+  const [open, setOpen] = (0, import_react63.useState)(false);
+  const busyRef = (0, import_react63.useRef)(false);
+  const titleId = (0, import_react63.useId)();
   const answer = (approve) => {
     if (busyRef.current) return;
     busyRef.current = true;
@@ -27278,68 +27494,68 @@ function ProposalCard({ proposal, initialError = "", onFailure, onResolved, acti
   };
   const update = proposal.action === "update";
   const agents = proposal.kind === "agents";
-  const rows2 = (0, import_react62.useMemo)(() => lineDiff(update ? proposal.previous?.content : "", proposal.content), [update, proposal.previous?.content, proposal.content]);
+  const rows2 = (0, import_react63.useMemo)(() => lineDiff(update ? proposal.previous?.content : "", proposal.content), [update, proposal.previous?.content, proposal.content]);
   const change = agents ? [
-    (0, import_react62.createElement)(FileBox, { key: "file", name: "AGENTS.md", path: proposal.folder, state: proposal.exists === false ? "Added" : "Modified", blocks: proposal.edits.map((edit) => [
+    (0, import_react63.createElement)(FileBox, { key: "file", name: "AGENTS.md", path: proposal.folder, state: proposal.exists === false ? "Added" : "Modified", blocks: proposal.edits.map((edit) => [
       ...(edit.op === "add" ? [] : editLines(edit.old)).map((line) => ({ kind: "removed", line })),
       ...(edit.op === "remove" ? [] : editLines(edit.text)).map((line) => ({ kind: "added", line }))
     ]) }),
-    ...proposal.edits.map((edit, index) => edit.why ? (0, import_react62.createElement)("p", { className: "bt-learning-why", key: `why-${index}` }, edit.why) : null)
+    ...proposal.edits.map((edit, index) => edit.why ? (0, import_react63.createElement)("p", { className: "bt-learning-why", key: `why-${index}` }, edit.why) : null)
   ] : [
-    (0, import_react62.createElement)(FileBox, { key: "file", name: "SKILL.md", path: `skills/${proposal.name}`, state: update ? "Updated" : "Added", blocks: [rows2] }),
-    proposal.why ? (0, import_react62.createElement)("p", { className: "bt-learning-why", key: "why" }, proposal.why) : null
+    (0, import_react63.createElement)(FileBox, { key: "file", name: "SKILL.md", path: `skills/${proposal.name}`, state: update ? "Updated" : "Added", blocks: [rows2] }),
+    proposal.why ? (0, import_react63.createElement)("p", { className: "bt-learning-why", key: "why" }, proposal.why) : null
   ];
   const kind = t(agents ? "AGENTS.md update" : update ? "Skill update" : "New skill");
   if (outcome) {
     const what = agents ? proposal.folder : proposal.name;
-    return (0, import_react62.createElement)(
+    return (0, import_react63.createElement)(
       "section",
       { className: "bt-q bt-q-settled bt-learning-card bt-learning-settled", role: "group", "aria-label": `${kind} · ${what}`, "data-outcome": outcome },
-      (0, import_react62.createElement)(
+      (0, import_react63.createElement)(
         "button",
         { type: "button", className: "bt-learning-fold", "aria-expanded": open, onClick: () => setOpen(!open) },
-        (0, import_react62.createElement)("span", { className: "bt-learning-icon", "aria-hidden": true }, (0, import_react62.createElement)(agents ? PencilIcon : MemoryIcon)),
-        (0, import_react62.createElement)("span", { className: "bt-learning-kind" }, kind),
-        (0, import_react62.createElement)("span", { className: "bt-learning-sum" }, `${t(outcome === "approved" ? "Approved" : "Declined")} · ${what}`)
+        (0, import_react63.createElement)("span", { className: "bt-learning-icon", "aria-hidden": true }, (0, import_react63.createElement)(agents ? PencilIcon : MemoryIcon)),
+        (0, import_react63.createElement)("span", { className: "bt-learning-kind" }, kind),
+        (0, import_react63.createElement)("span", { className: "bt-learning-sum" }, `${t(outcome === "approved" ? "Approved" : "Declined")} · ${what}`)
       ),
       open ? change : null
     );
   }
   const oldDetail = update && typeof proposal.previous?.description === "string" && proposal.previous.description !== proposal.description ? proposal.previous.description : void 0;
-  return (0, import_react62.createElement)(
+  return (0, import_react63.createElement)(
     "section",
     { className: "bt-q bt-learning-card", role: "group", "aria-labelledby": titleId, "aria-busy": busy },
-    agents ? (0, import_react62.createElement)(ProposalHead, { titleId, icon: PencilIcon, title: kind }) : (0, import_react62.createElement)(ProposalHead, { titleId, title: proposal.name, kind, detail: proposal.description, oldDetail }),
+    agents ? (0, import_react63.createElement)(ProposalHead, { titleId, icon: PencilIcon, title: kind }) : (0, import_react63.createElement)(ProposalHead, { titleId, title: proposal.name, kind, detail: proposal.description, oldDetail }),
     change,
-    error ? (0, import_react62.createElement)("div", { className: "bt-learning-error", role: "alert" }, error) : null,
-    (0, import_react62.createElement)(ProposalFoot, { busy, answer })
+    error ? (0, import_react63.createElement)("div", { className: "bt-learning-error", role: "alert" }, error) : null,
+    (0, import_react63.createElement)(ProposalFoot, { busy, answer })
   );
 }
 function ProposalHead({ titleId, icon: icon2 = MemoryIcon, title, kind, detail, oldDetail }) {
-  return (0, import_react62.createElement)(
+  return (0, import_react63.createElement)(
     "div",
     { className: "bt-q-head" },
-    (0, import_react62.createElement)("span", { className: "bt-learning-icon", "aria-hidden": true }, (0, import_react62.createElement)(icon2)),
-    (0, import_react62.createElement)(
+    (0, import_react63.createElement)("span", { className: "bt-learning-icon", "aria-hidden": true }, (0, import_react63.createElement)(icon2)),
+    (0, import_react63.createElement)(
       "div",
       { className: "bt-q-text" },
-      (0, import_react62.createElement)("p", { className: "bt-q-title", id: titleId }, title),
-      kind ? (0, import_react62.createElement)("div", { className: "bt-q-detail" }, kind) : null,
-      oldDetail ? (0, import_react62.createElement)("p", { className: "bt-learning-description bt-learning-old" }, (0, import_react62.createElement)("del", null, oldDetail)) : null,
-      detail ? (0, import_react62.createElement)("p", { className: "bt-learning-description" }, detail) : null
+      (0, import_react63.createElement)("p", { className: "bt-q-title", id: titleId }, title),
+      kind ? (0, import_react63.createElement)("div", { className: "bt-q-detail" }, kind) : null,
+      oldDetail ? (0, import_react63.createElement)("p", { className: "bt-learning-description bt-learning-old" }, (0, import_react63.createElement)("del", null, oldDetail)) : null,
+      detail ? (0, import_react63.createElement)("p", { className: "bt-learning-description" }, detail) : null
     ),
-    (0, import_react62.createElement)("span", { className: "bt-q-badge bt-learning-status" }, (0, import_react62.createElement)("span", { className: "bt-learning-dot", "aria-hidden": true }), t("Awaiting approval"))
+    (0, import_react63.createElement)("span", { className: "bt-q-badge bt-learning-status" }, (0, import_react63.createElement)("span", { className: "bt-learning-dot", "aria-hidden": true }), t("Awaiting approval"))
   );
 }
 function ProposalFoot({ busy, answer }) {
-  return (0, import_react62.createElement)(
+  return (0, import_react63.createElement)(
     "div",
     { className: "bt-q-foot bt-learning-foot" },
-    (0, import_react62.createElement)("button", { type: "button", className: "bt-learning-btn bt-learning-decline", disabled: busy, onClick: () => answer(false) }, t("Decline")),
-    (0, import_react62.createElement)(
+    (0, import_react63.createElement)("button", { type: "button", className: "bt-learning-btn bt-learning-decline", disabled: busy, onClick: () => answer(false) }, t("Decline")),
+    (0, import_react63.createElement)(
       "button",
       { type: "button", className: "bt-learning-btn bt-learning-approve", disabled: busy, onClick: () => answer(true) },
-      (0, import_react62.createElement)(CheckIcon),
+      (0, import_react63.createElement)(CheckIcon),
       t("Approve")
     )
   );
@@ -27347,43 +27563,43 @@ function ProposalFoot({ busy, answer }) {
 var COLLAPSE_ROWS = 8;
 var SIGNS = { added: "+", removed: "−", same: "" };
 function FileBox({ name, path: path2, state, blocks }) {
-  const [open, setOpen] = (0, import_react62.useState)(false);
+  const [open, setOpen] = (0, import_react63.useState)(false);
   const all = blocks.flat();
   const added = all.filter((row) => row.kind === "added").length;
   const removed = all.filter((row) => row.kind === "removed").length;
   const folds = all.length > COLLAPSE_ROWS;
   const shut = folds && !open;
-  return (0, import_react62.createElement)(
+  return (0, import_react63.createElement)(
     "div",
     { className: "bt-learning-file" },
-    (0, import_react62.createElement)(
+    (0, import_react63.createElement)(
       "div",
       { className: "bt-learning-filehead" },
-      (0, import_react62.createElement)("span", { className: "bt-learning-name" }, name),
-      path2 ? (0, import_react62.createElement)("span", { className: "bt-learning-path" }, path2) : null,
-      (0, import_react62.createElement)("span", { className: "bt-learning-spacer" }),
-      added > 0 ? (0, import_react62.createElement)("span", { className: "bt-learning-plus" }, `+${added}`) : null,
-      removed > 0 ? (0, import_react62.createElement)("span", { className: "bt-learning-minus" }, `−${removed}`) : null,
-      (0, import_react62.createElement)("span", { className: `bt-learning-state bt-learning-state-${state.toLowerCase()}` }, t(state))
+      (0, import_react63.createElement)("span", { className: "bt-learning-name" }, name),
+      path2 ? (0, import_react63.createElement)("span", { className: "bt-learning-path" }, path2) : null,
+      (0, import_react63.createElement)("span", { className: "bt-learning-spacer" }),
+      added > 0 ? (0, import_react63.createElement)("span", { className: "bt-learning-plus" }, `+${added}`) : null,
+      removed > 0 ? (0, import_react63.createElement)("span", { className: "bt-learning-minus" }, `−${removed}`) : null,
+      (0, import_react63.createElement)("span", { className: `bt-learning-state bt-learning-state-${state.toLowerCase()}` }, t(state))
     ),
-    (0, import_react62.createElement)(
+    (0, import_react63.createElement)(
       "div",
       { className: shut ? "bt-learning-code bt-learning-shut" : "bt-learning-code" },
       blocks.map((rows2, blockIndex) => [
-        blockIndex > 0 ? (0, import_react62.createElement)("div", { className: "bt-learning-gap", key: `gap-${blockIndex}` }) : null,
-        ...rows2.map((row, rowIndex) => (0, import_react62.createElement)(
+        blockIndex > 0 ? (0, import_react63.createElement)("div", { className: "bt-learning-gap", key: `gap-${blockIndex}` }) : null,
+        ...rows2.map((row, rowIndex) => (0, import_react63.createElement)(
           "div",
           { className: `bt-learning-row bt-learning-${row.kind}`, key: `${blockIndex}-${rowIndex}` },
-          (0, import_react62.createElement)("span", { className: "bt-learning-num", "aria-hidden": true }, row.number ?? ""),
-          (0, import_react62.createElement)("span", { className: "bt-learning-sign", "aria-hidden": true }, SIGNS[row.kind]),
-          (0, import_react62.createElement)("span", { className: "bt-learning-text" }, row.line || " ")
+          (0, import_react63.createElement)("span", { className: "bt-learning-num", "aria-hidden": true }, row.number ?? ""),
+          (0, import_react63.createElement)("span", { className: "bt-learning-sign", "aria-hidden": true }, SIGNS[row.kind]),
+          (0, import_react63.createElement)("span", { className: "bt-learning-text" }, row.line || " ")
         ))
       ])
     ),
-    folds ? (0, import_react62.createElement)(
+    folds ? (0, import_react63.createElement)(
       "div",
       { className: shut ? "bt-learning-morebar bt-learning-morebar-shut" : "bt-learning-morebar" },
-      (0, import_react62.createElement)(
+      (0, import_react63.createElement)(
         "button",
         { type: "button", className: "bt-learning-more", "aria-expanded": open, onClick: () => setOpen(!open) },
         t(open ? "Show less" : "Show all {count} lines", { count: all.length })
@@ -27394,7 +27610,7 @@ function FileBox({ name, path: path2, state, blocks }) {
 function LearningProposals({ turn, dock, sessionId, useRoster, actions }) {
   const roster = useRoster((value) => value);
   const facts = useTurnFacts(sessionId, actions);
-  const [failed, setFailed] = (0, import_react62.useState)({});
+  const [failed, setFailed] = (0, import_react63.useState)({});
   const bot = roster.byId?.[sessionId];
   if (!bot || currentPart(bot) !== sessionId) return null;
   const proposals = roster.learning?.[bot.id] ?? [];
@@ -27423,10 +27639,10 @@ function LearningProposals({ turn, dock, sessionId, useRoster, actions }) {
     delete next[id];
     return next;
   });
-  return (0, import_react62.createElement)("div", { className: dock ? "bt-learning-stack bt-learning-dock" : "bt-learning-stack" }, cards.map((proposal) => (0, import_react62.createElement)(
+  return (0, import_react63.createElement)("div", { className: dock ? "bt-learning-stack bt-learning-dock" : "bt-learning-stack" }, cards.map((proposal) => (0, import_react63.createElement)(
     "div",
     { className: "bt-q-inline", key: proposal.id },
-    (0, import_react62.createElement)(ProposalCard, {
+    (0, import_react63.createElement)(ProposalCard, {
       proposal,
       initialError: failed[proposal.id]?.error ?? failedAnswers.get(proposal.id)?.error,
       onFailure,
@@ -27436,10 +27652,10 @@ function LearningProposals({ turn, dock, sessionId, useRoster, actions }) {
   )));
 }
 function LearningTurnTail(props) {
-  return (0, import_react62.createElement)(LearningProposals, { ...props, dock: false });
+  return (0, import_react63.createElement)(LearningProposals, { ...props, dock: false });
 }
 function LearningDock(props) {
-  return (0, import_react62.createElement)(LearningProposals, { ...props, dock: true });
+  return (0, import_react63.createElement)(LearningProposals, { ...props, dock: true });
 }
 var LEARNING_CSS = `
 .bt-learning-stack{display:flex;flex-direction:column;gap:4px}
@@ -27527,138 +27743,6 @@ function createSwitchWindow(settle) {
     }
   };
 }
-
-// src/client/approval-queue.js
-var import_react63 = require("react");
-var NO_WORK2 = { approvals: [] };
-function approvalsOf(work, chat) {
-  return (work?.approvals ?? NO_WORK2.approvals).filter((entry) => approvalChat(entry) === chat).sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
-}
-function closedApprovals(state, chat, pending = []) {
-  return Object.values(state?.closed?.[chat] ?? {}).filter((entry) => !pending.some((open) => open.id === entry.approval.id)).sort((a, b) => a.at - b.at);
-}
-var APPROVAL_STALE = "This approval is no longer open";
-function vanishedApprovals(prev, next) {
-  const open = new Set((next?.approvals ?? []).map((entry) => entry.id));
-  return (prev?.approvals ?? []).filter((entry) => !open.has(entry.id));
-}
-function closeVanishedApprovals(state, prev, next, { at = Date.now(), message = APPROVAL_STALE } = {}) {
-  const vanished = vanishedApprovals(prev, next);
-  if (vanished.length === 0) return state;
-  const settled = { ...state?.settled ?? {} };
-  const closed = { ...state?.closed ?? {} };
-  let changed = false;
-  for (const entry of vanished) {
-    if (settled[entry.id] === true) {
-      delete settled[entry.id];
-      changed = true;
-      continue;
-    }
-    const chat = approvalChat(entry);
-    if (closed[chat]?.[entry.id] !== void 0) continue;
-    closed[chat] = { ...closed[chat] ?? {}, [entry.id]: { approval: entry, message, at } };
-    changed = true;
-  }
-  return changed ? { ...state, closed, settled } : state;
-}
-function waitingIn(work, state, chat) {
-  const pending = approvalsOf(work, chat);
-  return pending.length > 0 || closedApprovals(state, chat, pending).length > 0;
-}
-function approvalCellWanted(roster, work, state, sessionId) {
-  if (sessionId === void 0) return false;
-  if (roster?.roomsById?.[sessionId] !== void 0) return false;
-  if (roster?.questions?.[sessionId] !== void 0) return false;
-  return waitingIn(work, state, sessionId);
-}
-var approvalCellKey = (work, state) => JSON.stringify([
-  (work?.approvals ?? []).map((entry) => entry.id),
-  Object.entries(state?.closed ?? {}).map(([chat, cards]) => [chat, Object.keys(cards)]).sort()
-]);
-function ApprovalCard2({ approval, bot, actions, error }) {
-  const [busy, setBusy] = (0, import_react63.useState)(false);
-  const [answered, setAnswered] = (0, import_react63.useState)(null);
-  const answer = (choice) => {
-    if (busy) return;
-    setBusy(true);
-    void Promise.resolve(actions.answerApproval(approval.id, choice)).then(() => setAnswered(choice)).catch((failure) => actions.reportApprovalFailure(approval, failure)).finally(() => setBusy(false));
-  };
-  const waiting = t("{name} is waiting for your approval", { name: bot?.name ?? t("A Bot") });
-  return (0, import_react63.createElement)(
-    "div",
-    { className: "bt-aq-card", role: "group", "aria-label": error ?? waiting },
-    (0, import_react63.createElement)(
-      "div",
-      { className: "bt-aq-head" },
-      bot ? (0, import_react63.createElement)(BotMark, { bot, size: 18, state: error ? "idle" : "alert" }) : null,
-      (0, import_react63.createElement)("span", { className: "bt-aq-name" }, bot?.name ?? t("A Bot")),
-      approval.tool ? (0, import_react63.createElement)("span", { className: "bt-aq-tool" }, approval.tool) : null
-    ),
-    approval.detail?.text ? (0, import_react63.createElement)("div", { className: "bt-aq-text" }, approval.detail.text) : null,
-    approval.reason ? (0, import_react63.createElement)("div", { className: "bt-aq-reason" }, approval.reason) : null,
-    approval.detail?.code ? (0, import_react63.createElement)("code", { className: "bt-aq-code", title: approval.detail.code }, approval.detail.code) : null,
-    error ? (0, import_react63.createElement)(
-      "div",
-      { className: "bt-aq-closed" },
-      (0, import_react63.createElement)("span", { className: "bt-aq-error", role: "alert" }, error),
-      (0, import_react63.createElement)("button", { type: "button", className: "bt-aq-btn", onClick: () => actions.dismissApproval(approval) }, t("Dismiss"))
-    ) : answered ? (0, import_react63.createElement)("div", { className: "bt-aq-done", role: "status" }, t(answered === "allow" ? "Allowed" : "Rejected")) : (0, import_react63.createElement)(
-      "div",
-      { className: "bt-aq-actions" },
-      (0, import_react63.createElement)("button", { type: "button", className: "bt-aq-btn", disabled: busy, onClick: () => answer("reject") }, t("Reject")),
-      (0, import_react63.createElement)("button", { type: "button", className: "bt-aq-go", disabled: busy, onClick: () => answer("allow") }, t("Allow once"))
-    )
-  );
-}
-function ApprovalQueue({ sessionId, cell, useWork, useApprovals, useRoster, actions }) {
-  const roster = useRoster((value) => value);
-  const work = useWork((value) => value ?? NO_WORK2);
-  const state = useApprovals((value) => value);
-  const room2 = roster.roomsById?.[sessionId];
-  const chat = room2 ? room2.id : sessionId;
-  const pending = approvalsOf(work, chat);
-  const closed = closedApprovals(state, chat, pending);
-  if (pending.length === 0 && closed.length === 0) return null;
-  const count = pending.length;
-  const many = count > 1 ? t("{count} waiting for approval", { count }) : null;
-  const label = count === 1 ? t("{name} is waiting for your approval", { name: roster.byId[pending[0].botId]?.name ?? t("A Bot") }) : many;
-  return (0, import_react63.createElement)(
-    "div",
-    { className: "bt-aq", "data-cell": cell || void 0, "data-count": count, role: "group", "aria-label": label },
-    many ? (0, import_react63.createElement)("div", { className: "bt-aq-count" }, many) : null,
-    pending.map((approval) => (0, import_react63.createElement)(ApprovalCard2, { key: approval.id, approval, bot: roster.byId[approval.botId], actions })),
-    closed.map((entry) => (0, import_react63.createElement)(ApprovalCard2, { key: entry.approval.id, approval: entry.approval, bot: roster.byId[entry.approval.botId], actions, error: entry.message }))
-  );
-}
-function ApprovalCell(props) {
-  return (0, import_react63.createElement)(ApprovalQueue, { ...props, cell: true });
-}
-function ApprovalDock(props) {
-  const roster = props.useRoster((value) => value);
-  if (roster.roomsById?.[props.sessionId] === void 0) return null;
-  return (0, import_react63.createElement)(ApprovalQueue, props);
-}
-var APPROVAL_CSS = `
-.bt-aq{display:flex;flex-direction:column;gap:6px;box-sizing:border-box;width:calc(100% - var(--dsh-composer-side-clearance,0px) - var(--dsh-composer-side-clearance,0px) - var(--dsh-composer-dock-inset,0px) - var(--dsh-composer-dock-inset,0px));max-width:calc(var(--dsh-composer-card-max-width,748px) - var(--dsh-composer-dock-inset,0px) - var(--dsh-composer-dock-inset,0px));margin:0 auto 8px;padding:0 var(--dsh-composer-dock-inset,0px);flex:none}
-.bt-aq[data-cell]{width:auto;max-width:var(--dsh-chat-content-width,748px);margin:0 auto;padding:8px calc(var(--dsh-composer-side-clearance,0px) + 16px) 12px}
-.bt-aq-count{padding:0 2px;font-size:12px;line-height:16px;color:var(--bt-ink-3)}
-.bt-aq-card{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:12px;background:var(--bt-hover);font-size:12px;line-height:17px;color:var(--bt-ink-2);animation:bt-rise .2s ease-out backwards}
-.bt-aq-head{display:flex;align-items:center;gap:6px;min-width:0;font-weight:600;color:var(--bt-ink)}
-.bt-aq-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bt-aq-tool{flex:none;font-weight:400;color:var(--bt-ink-3);font:11px/16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.bt-aq-text{color:var(--bt-ink);overflow-wrap:anywhere}
-.bt-aq-reason{overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.bt-aq-code{display:block;padding:4px 8px;border-radius:6px;background:var(--bt-main);font:11px/16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--bt-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.bt-aq-actions,.bt-aq-closed{display:flex;align-items:center;justify-content:flex-end;gap:6px;margin-top:4px}
-.bt-aq-error{flex:1;min-width:0;color:var(--bt-danger);overflow-wrap:anywhere}
-.bt-aq-done{margin-top:4px;text-align:right;color:var(--bt-ink-3)}
-.bt-aq-btn,.bt-aq-go{height:28px;padding:0 12px;border:0;border-radius:999px;font:inherit;font-size:12px;cursor:pointer}
-.bt-aq-btn{background:var(--bt-main);box-shadow:inset 0 0 0 .5px var(--bt-line-2);color:var(--bt-ink-2)}
-.bt-aq-btn:hover{background:var(--bt-active);color:var(--bt-ink)}
-.bt-aq-go{background:var(--bt-ink);color:var(--bt-main)}
-.bt-aq-btn:disabled,.bt-aq-go:disabled{opacity:.5;cursor:default}
-@media (prefers-reduced-motion:reduce){.bt-aq-card{animation:none}}
-`;
 
 // src/client/queue-dock.js
 var import_react64 = require("react");
@@ -28389,6 +28473,13 @@ function apply(ctx) {
     hubChat: (id, kind, cursor) => call("hub-chat", { ...kind === "room" ? { roomId: id } : { botId: id }, ...cursor?.epoch !== void 0 ? { epoch: cursor.epoch, since: cursor.revision } : {} }),
     hubSend: (id, kind, text, messageId) => call("hub-send", { ...kind === "room" ? { roomId: id } : { botId: id }, text, messageId }),
     hubEarlier: (id, kind) => call("hub-earlier", { ...kind === "room" ? { roomId: id } : { botId: id } }),
+    // A card answer the node's chat view forwards to the hub, which applies it to the
+    // one writer and answers idempotently by card id.
+    hubApprovalAnswer: (approvalId, choice) => call("hub-approval-answer", { approvalId, choice }),
+    hubQuestionAnswer: (id, kind, questionId, answer) => call("hub-question-answer", { ...kind === "room" ? { roomId: id } : { botId: id }, questionId, answer }),
+    hubQuestionDismiss: (id, kind) => call("hub-question-dismiss", { ...kind === "room" ? { roomId: id } : { botId: id } }),
+    hubViewAnswer: (id, kind, viewId, action, values) => call("hub-view-answer", { ...kind === "room" ? { roomId: id } : { botId: id }, viewId, action, values }),
+    hubViewDismiss: (id, kind) => call("hub-view-dismiss", { ...kind === "room" ? { roomId: id } : { botId: id } }),
     openHubChat: (id, kind, name) => ui2.set((state) => ({ ...state, hubChat: { id, kind, name }, details: null, view: "details", renaming: false, tab: null, newChat: null, exchange: null, menu: null, palette: null })),
     closeHubChat: () => ui2.set((state) => state.hubChat === null ? state : { ...state, hubChat: null }),
     openSession: (id) => {

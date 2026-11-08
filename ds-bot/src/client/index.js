@@ -505,6 +505,13 @@ export function apply(ctx) {
     hubChat: (id, kind, cursor) => call('hub-chat', { ...(kind === 'room' ? { roomId: id } : { botId: id }), ...(cursor?.epoch !== undefined ? { epoch: cursor.epoch, since: cursor.revision } : {}) }),
     hubSend: (id, kind, text, messageId) => call('hub-send', { ...(kind === 'room' ? { roomId: id } : { botId: id }), text, messageId }),
     hubEarlier: (id, kind) => call('hub-earlier', { ...(kind === 'room' ? { roomId: id } : { botId: id }) }),
+    // A card answer the node's chat view forwards to the hub, which applies it to the
+    // one writer and answers idempotently by card id.
+    hubApprovalAnswer: (approvalId, choice) => call('hub-approval-answer', { approvalId, choice }),
+    hubQuestionAnswer: (id, kind, questionId, answer) => call('hub-question-answer', { ...(kind === 'room' ? { roomId: id } : { botId: id }), questionId, answer }),
+    hubQuestionDismiss: (id, kind) => call('hub-question-dismiss', { ...(kind === 'room' ? { roomId: id } : { botId: id }) }),
+    hubViewAnswer: (id, kind, viewId, action, values) => call('hub-view-answer', { ...(kind === 'room' ? { roomId: id } : { botId: id }), viewId, action, values }),
+    hubViewDismiss: (id, kind) => call('hub-view-dismiss', { ...(kind === 'room' ? { roomId: id } : { botId: id }) }),
     openHubChat: (id, kind, name) => ui.set(state => ({ ...state, hubChat: { id, kind, name }, details: null, view: 'details', renaming: false, tab: null, newChat: null, exchange: null, menu: null, palette: null })),
     closeHubChat: () => ui.set(state => (state.hubChat === null ? state : { ...state, hubChat: null })),
     openSession: (id) => {

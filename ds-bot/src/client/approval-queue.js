@@ -84,7 +84,7 @@ export const approvalCellKey = (work, state) => JSON.stringify([
   Object.entries(state?.closed ?? {}).map(([chat, cards]) => [chat, Object.keys(cards)]).sort(),
 ])
 
-function ApprovalCard({ approval, bot, actions, error }) {
+export function ApprovalCard({ approval, bot, actions, error }) {
   const [busy, setBusy] = useState(false)
   const [answered, setAnswered] = useState(null)
   const answer = (choice) => {
