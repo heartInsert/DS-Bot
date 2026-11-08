@@ -16,6 +16,7 @@ import { APPROVED_NOTE, classifyCommand, describePolicy } from './policy.js'
 import { MAX_FILE_BYTES, taskLabel } from './protocol.js'
 import { bestDevice, hintedDevice } from './select.js'
 import { createSessionSync } from './session-sync.js'
+import { backupTeam, createTeamSource, syncTeam, teamApplyMarkerPath } from './team-sync.js'
 
 const DEFAULT_PORT = 8787
 const DEFAULT_WAIT_MS = 20_000
@@ -408,6 +409,10 @@ export function install(rt) {
   // The hub this computer joined from this page, kept in the team file so a restart
   // comes back as the same node. A device.json alone belongs to a worker the CLI runs.
   let nodeJoined
+  // Where the team of the last join was backed up, and what the last team sync took over.
+  // Both are shown by the Devices page so the user can find the copy if they want it back.
+  let lastBackup
+  let lastSync
   // The conversation sync is created once, with the plugin runtime: the hub is the one
   // writer of the Session, and a node only ever reads snapshots of it.
   let sessionSync
@@ -416,6 +421,9 @@ export function install(rt) {
   } catch (error) {
     rt.warn('ds-bot: LAN session sync is off: %s', error.message)
   }
+  // The team this computer would hand to a machine that joins it. Like the conversation,
+  // it reads the live team each time, so an edit made a second ago is in the next join.
+  const teamSync = createTeamSource({ state: () => rt.state, home: () => rt.home, name: options.name })
 
   const savedDevice = () => readDevice(options.dataDir)
 
@@ -429,6 +437,8 @@ export function install(rt) {
       state: info?.status ?? (nodeJoined === undefined ? 'unpaired' : 'offline'),
       online: info?.status === 'online',
       error: info?.lastError ?? nodeError,
+      ...(lastBackup === undefined ? {} : { backup: lastBackup.dir }),
+      ...(lastSync === undefined ? {} : { team: lastSync }),
       ...(joining === undefined ? {} : { joining: { ...joining } }),
     }
   }
@@ -506,7 +516,7 @@ export function install(rt) {
       try {
         // The plugin runs the hub, so the shortest path is one process. The CLI can also
         // read the same data folder (nodes.json, admin.token) while this hub runs.
-        hub = createHub({ ...options, sessionSync, log: () => {} })
+        hub = createHub({ ...options, sessionSync, teamSync, log: () => {} })
       } catch (error) {
         hub = undefined
         phase = 'failed'
@@ -618,6 +628,32 @@ export function install(rt) {
     if (current !== undefined) await current.stop().catch(() => {})
   }
 
+  // A node that joined earlier follows the hub's team again after a restart, so a hub that
+  // changed while this machine was off does not leave two different teams behind. The
+  // applied marker makes it a no-op when nothing changed: no file is written twice and a
+  // reconnect cannot duplicate a Bot.
+  const refreshTeam = async () => {
+    if (nodeJoined === undefined) return undefined
+    const saved = savedDevice()
+    if (saved === undefined || typeof saved.hubUrl !== 'string' || typeof saved.token !== 'string') return undefined
+    try {
+      lastSync = await syncTeam({
+        rt,
+        hubUrl: saved.hubUrl,
+        token: saved.token,
+        dataDir: options.dataDir,
+        hubId: saved.hubUrl,
+        log: (message, ...args) => rt.warn(message, ...args),
+      })
+    } catch (error) {
+      // The worker reports the connection itself; an unreachable hub must not keep the
+      // local team from loading.
+      lastSync = undefined
+      rt.warn('ds-bot lan: the hub team could not be read: %s', error.message)
+    }
+    return lastSync
+  }
+
   const saveJoined = async (value) => {
     await rt.load()
     rt.state.multiDevice ??= {}
@@ -652,8 +688,19 @@ export function install(rt) {
     if (!/^https?:\/\/[^/\s]+/.test(url)) throw new Error('Enter the hub address, such as http://192.168.1.23:8787.')
     await rt.load()
     nodeError = undefined
+    // The copy comes first. Taking over the hub's team replaces the Bots, memory and
+    // settings here, so a join that cannot write a backup must not ask the hub for
+    // anything: nothing is sent and nothing is replaced.
+    let backup
+    try {
+      backup = backupTeam({ home: rt.home, dataDir: options.dataDir })
+    } catch (error) {
+      nodeError = `Could not back up this computer's team, so nothing was changed: ${error.message}`
+      throw new Error(nodeError)
+    }
+    lastBackup = backup
     joinAbort = new AbortController()
-    joining = { state: 'waiting', url, startedAt: new Date().toISOString() }
+    joining = { state: 'waiting', url, startedAt: new Date().toISOString(), backup: backup.dir }
     void joinHub({
       hubUrl: url,
       dataDir: options.dataDir,
@@ -663,8 +710,32 @@ export function install(rt) {
         if (joining !== undefined && typeof hubName === 'string') joining.hub = hubName
       },
     }).then(async saved => {
-      nodeJoined = { hubUrl: saved.hubUrl, hubName: saved.hubName, nodeName: saved.nodeName }
       joining = undefined
+      const joined = { hubUrl: saved.hubUrl, hubName: saved.hubName, nodeName: saved.nodeName }
+      // Bring the hub's team over before this machine counts as joined: a node that shows
+      // "joined" but still runs its own Bots would be a half-join. A failed apply has
+      // already put the local team back, so the join is abandoned instead.
+      try {
+        lastSync = await syncTeam({
+          rt,
+          hubUrl: saved.hubUrl,
+          token: saved.token,
+          dataDir: options.dataDir,
+          hubId: saved.hubUrl,
+          backup,
+          log: (message, ...args) => rt.warn(message, ...args),
+        })
+      } catch (error) {
+        nodeJoined = undefined
+        try {
+          unlinkSync(deviceFile(options.dataDir))
+        } catch {
+          // Already gone: this machine is not a node either way.
+        }
+        nodeError = `Joined ${saved.hubName ?? saved.hubUrl}, but its team could not be applied, so this computer is not joined and its own team is unchanged: ${error.message}`
+        return
+      }
+      nodeJoined = joined
       try {
         await saveJoined(nodeJoined)
       } catch (error) {
@@ -692,10 +763,15 @@ export function install(rt) {
     joining = undefined
     await stopNode()
     nodeJoined = undefined
-    try {
-      unlinkSync(deviceFile(options.dataDir))
-    } catch {
-      // Already gone: the worker is stopped either way.
+    // The team this machine took over stays; only the join itself is forgotten, so a join
+    // to that hub again applies its team afresh instead of trusting an old marker.
+    lastSync = undefined
+    for (const file of [deviceFile(options.dataDir), teamApplyMarkerPath(options.dataDir)]) {
+      try {
+        unlinkSync(file)
+      } catch {
+        // Already gone: the worker is stopped either way.
+      }
     }
     nodeError = undefined
     await saveJoined(undefined)
@@ -732,6 +808,10 @@ export function install(rt) {
     multiDeviceApproveJoin: approveJoin,
     multiDeviceDenyJoin: denyJoin,
     multiDeviceView: status,
+    // The node's worker and a team refresh, for the multi-node simulation and the tests;
+    // the page uses the status above.
+    multiDeviceNodeWorker: () => nodeWorker,
+    multiDeviceRefreshTeam: refreshTeam,
   })
 
   // The saved choice is read once the team file is loaded; the profile only supplies
@@ -747,8 +827,11 @@ export function install(rt) {
     const joined = rt.state?.multiDevice?.node
     nodeJoined = joined !== null && typeof joined === 'object' && typeof joined.hubUrl === 'string' ? joined : undefined
     startNode()
-    // A node does not serve a second center, whatever the stored switch says.
-    if (nodeJoined !== undefined) return
+    if (nodeJoined !== undefined) {
+      // Not awaited: the page and the Bot team must open even when the hub is asleep.
+      void refreshTeam()
+      return
+    }
     if (profileOff) return
     const stored = rt.state?.multiDevice?.enabled
     enabled = typeof stored === 'boolean' ? stored : profileOn

@@ -1680,7 +1680,12 @@ var HOST_ZH = {
   Cancel: "取消",
   Leave: "退出",
   Advanced: "高级",
-  "Pairing code for the command line": "命令行配对码"
+  "Pairing code for the command line": "命令行配对码",
+  "Waiting to join · {count}": "等待加入 · {count}",
+  "Join {name}?": "加入 {name}？",
+  "This computer's Bots, memory and settings are replaced by the hub's. They are backed up first.": "这台电脑的 Bot、记忆和设置会被中心的覆盖；覆盖前先备份。",
+  "Replace and join": "备份并加入",
+  Backup: "备份"
 };
 Object.assign(ZH, HOST_ZH);
 var fill = (text, params) => params ? text.replace(/\{(\w+)\}/g, (match, name) => name in params ? String(params[name]) : match) : text;
@@ -14874,6 +14879,7 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
   const [manual, setManual] = (0, import_react33.useState)("");
   const [busy, setBusy] = (0, import_react33.useState)(false);
   const [confirming, setConfirming] = (0, import_react33.useState)("");
+  const [joinConfirm, setJoinConfirm] = (0, import_react33.useState)(null);
   (0, import_react33.useEffect)(() => {
     if (!confirming) return void 0;
     const timer = setTimeout(() => setConfirming(""), 4e3);
@@ -14920,6 +14926,12 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
     }).finally(() => setBusy(false));
   };
   const join = (url) => {
+    if (busy || url === "") return;
+    setJoinConfirm({ url });
+  };
+  const joinNow = () => {
+    const url = joinConfirm?.url ?? "";
+    setJoinConfirm(null);
     if (busy || url === "") return;
     setBusy(true);
     void run2(Promise.resolve().then(() => actions.multiDeviceJoin(url)).then((value) => {
@@ -14976,7 +14988,8 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
       (0, import_react33.createElement)(Row4, {
         label: t("Joined {name}", { name }),
         hint: node.error ?? (node.online ? t("Online") : t("Offline"))
-      }, (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: leave }, t("Leave")))
+      }, (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: leave }, t("Leave"))),
+      node.backup === void 0 ? null : (0, import_react33.createElement)(Row4, { label: t("Backup"), hint: node.backup })
     )];
   }
   if (joining !== void 0) {
@@ -14988,20 +15001,25 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
         { label: t("Waiting for {name} to allow this computer…", { name: joining.hub ?? hostOf2(joining.url) }) },
         (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: leave }, t("Cancel"))
       ),
+      joining.backup === void 0 ? null : (0, import_react33.createElement)(Row4, { label: t("Backup"), hint: joining.backup }),
       node.error === void 0 ? null : (0, import_react33.createElement)(Row4, { label: node.error })
     )];
   }
-  const hubSection = (0, import_react33.createElement)(
+  const requestsSection = requests.length === 0 ? null : (0, import_react33.createElement)(
     Section2,
-    { key: "devices", title: t("Devices · {count}", { count: nodes.length }) },
+    { key: "requests", title: t("Waiting to join · {count}", { count: requests.length }) },
     requests.map((request) => (0, import_react33.createElement)(RequestRow, {
       key: request.id,
       request,
       busy,
       onAllow: (entry) => answer(entry, true),
       onDeny: (entry) => answer(entry, false)
-    })),
-    nodes.length === 0 ? (0, import_react33.createElement)(Row4, { label: requests.length === 0 ? t("No device yet.") : t("Allow the machine above to add it.") }) : nodes.map((entry) => (0, import_react33.createElement)(NodeRow, {
+    }))
+  );
+  const hubSection = (0, import_react33.createElement)(
+    Section2,
+    { key: "devices", title: t("Devices · {count}", { count: nodes.length }) },
+    nodes.length === 0 ? (0, import_react33.createElement)(Row4, { label: t("No device yet.") }) : nodes.map((entry) => (0, import_react33.createElement)(NodeRow, {
       key: entry.id,
       node: entry,
       confirming: confirming === entry.id,
@@ -15045,7 +15063,20 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
       (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy || manual.trim() === "", onClick: () => join(manual.trim()) }, t("Join"))
     ) : null
   );
+  const confirmSection = joinConfirm === null ? null : (0, import_react33.createElement)(
+    Section2,
+    { key: "confirm", title: t("Join {name}?", { name: hostOf2(joinConfirm.url) }) },
+    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("This computer's Bots, memory and settings are replaced by the hub's. They are backed up first.")),
+    (0, import_react33.createElement)(
+      "div",
+      { className: "bt-actions" },
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: joinNow }, t("Replace and join")),
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: () => setJoinConfirm(null) }, t("Cancel"))
+    )
+  );
   return [
+    confirmSection,
+    requestsSection,
     (0, import_react33.createElement)(
       Section2,
       { key: "switch", title: t("This computer") },
@@ -15065,7 +15096,7 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
       node.error === void 0 ? null : (0, import_react33.createElement)(Row4, { label: node.error })
     ),
     enabled ? hubSection : nearbySection
-  ];
+  ].filter((section) => section !== null);
 }
 var DEVICES_CSS = `
 .bt-dev-url{display:flex;align-items:center;gap:8px;min-width:0}

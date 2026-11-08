@@ -207,6 +207,9 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
   const [manual, setManual] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirming, setConfirming] = useState('')
+  // Joining replaces this computer's whole team, so the tap that starts it only opens the
+  // question; nothing is sent and nothing is replaced until the second button.
+  const [joinConfirm, setJoinConfirm] = useState(null)
 
   useEffect(() => {
     if (!confirming) return undefined
@@ -262,6 +265,13 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
   }
 
   const join = (url) => {
+    if (busy || url === '') return
+    setJoinConfirm({ url })
+  }
+
+  const joinNow = () => {
+    const url = joinConfirm?.url ?? ''
+    setJoinConfirm(null)
     if (busy || url === '') return
     setBusy(true)
     void run(Promise.resolve()
@@ -321,26 +331,33 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
       h(Row, {
         label: t('Joined {name}', { name }),
         hint: node.error ?? (node.online ? t('Online') : t('Offline')),
-      }, h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: leave }, t('Leave'))))]
+      }, h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: leave }, t('Leave'))),
+      node.backup === undefined ? null : h(Row, { label: t('Backup'), hint: node.backup }))]
   }
 
   if (joining !== undefined) {
     return [h(Section, { key: 'joining', title: t('This computer') },
       h(Row, { label: t('Waiting for {name} to allow this computer…', { name: joining.hub ?? hostOf(joining.url) }) },
         h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: leave }, t('Cancel'))),
+      joining.backup === undefined ? null : h(Row, { label: t('Backup'), hint: joining.backup }),
       node.error === undefined ? null : h(Row, { label: node.error }))]
   }
 
-  const hubSection = h(Section, { key: 'devices', title: t('Devices · {count}', { count: nodes.length }) },
+  // A machine asking to join is the one thing on this page that needs an answer, so it has
+  // its own block and is shown even when the hub is still starting or the switch is off:
+  // hiding it there is how a request goes unanswered.
+  const requestsSection = requests.length === 0 ? null : h(Section, { key: 'requests', title: t('Waiting to join · {count}', { count: requests.length }) },
     requests.map(request => h(RequestRow, {
       key: request.id,
       request,
       busy,
       onAllow: entry => answer(entry, true),
       onDeny: entry => answer(entry, false),
-    })),
+    })))
+
+  const hubSection = h(Section, { key: 'devices', title: t('Devices · {count}', { count: nodes.length }) },
     nodes.length === 0
-      ? h(Row, { label: requests.length === 0 ? t('No device yet.') : t('Allow the machine above to add it.') })
+      ? h(Row, { label: t('No device yet.') })
       : nodes.map(entry => h(NodeRow, {
         key: entry.id,
         node: entry,
@@ -371,7 +388,15 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
       }),
       h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy || manual.trim() === '', onClick: () => join(manual.trim()) }, t('Join'))) : null)
 
+  const confirmSection = joinConfirm === null ? null : h(Section, { key: 'confirm', title: t('Join {name}?', { name: hostOf(joinConfirm.url) }) },
+    h('div', { className: 'bt-dev-hint' }, t('This computer\'s Bots, memory and settings are replaced by the hub\'s. They are backed up first.')),
+    h('div', { className: 'bt-actions' },
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: joinNow }, t('Replace and join')),
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: () => setJoinConfirm(null) }, t('Cancel'))))
+
   return [
+    confirmSection,
+    requestsSection,
     h(Section, { key: 'switch', title: t('This computer') },
       h(Row, {
         label: t('Let this computer be the hub'),
@@ -385,7 +410,7 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
         h(CopyButton, { text: hub.url }))) : null,
       node.error === undefined ? null : h(Row, { label: node.error })),
     enabled ? hubSection : nearbySection,
-  ]
+  ].filter(section => section !== null)
 }
 
 export const DEVICES_CSS = `

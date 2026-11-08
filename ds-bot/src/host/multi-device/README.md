@@ -33,6 +33,49 @@ answer, and only `approveJoin` (the Allow button) creates the node and hands bac
 token. A denied or expired request pairs nothing. The six-digit code stays for a machine
 that runs the worker from the CLI, or for a network where the probe is blocked.
 
+The hub listens dual-stack when it is set to `0.0.0.0`, so an IPv4 client and a Mac that
+resolves the hostname to IPv6 reach the same hub; an IPv4-only bind is the fallback where
+IPv6 is unavailable. The address the page shows skips the virtual adapters Windows and
+macOS often have (Hyper-V, WSL, Docker, VirtualBox, VPN), which a machine on the link
+cannot reach. A pending request is written to `join-requests.json` in the hub's data
+folder, so a hub that restarts — the desktop app updating, or the switch turned off and
+on — still shows the machine that is waiting, and the Devices page keeps that block
+visible even while the hub is binding or its switch is off.
+
+## What a join replaces
+
+Joining is not only an address: the hub owns the team, so the joining machine takes the
+hub's team over. The Devices page asks first ("This computer's Bots, memory and settings
+are replaced by the hub's. They are backed up first."), and Cancel sends nothing.
+
+**Backup first.** Before anything is replaced, `state.json` and the whole `memory/` tree
+are copied to `<dataDir>/backups/join-<ISO time>/` (`team-sync.js`), and that path is
+shown on the Devices page after the join. A backup that cannot be written aborts the
+join before the hub is even asked: nothing is sent and nothing is replaced.
+
+**The synced scope (an allowlist, in `team-sync.js`).**
+
+| From `state.json` | From `<home>/memory/` |
+|---|---|
+| `bots`, `mainBotIds`, `rooms`, `privateArchives`, `agents`, `capabilities`, `prefs` | `team/`, `bots/`, `groups/`, `journal.jsonl`, `reviewed.json` (`.md`, `.json`, `.jsonl`, 512 KiB per file, 8 MiB in all) |
+
+**Never synced, and stated in code as `KEPT_LOCAL_STATE`:** credentials and API keys
+(`secrets.json`, the connectors' tokens, and any `apiKey`/`token`/`secret`/`password`
+key inside the team), the whole `multiDevice` block (device id, ports, the hub this
+computer joined), the computer-use permissions (`computer`), and machine paths — a Bot's
+or a group chat's `workDir` stays with the machine that had it. Session snapshots and the
+archive of deleted Bots stay on the hub.
+
+**All or nothing.** `applyTeamBundle` writes the memory files, replaces the allowlisted
+state keys and saves the team once through the store, so its lock and change detection
+stay in charge. Any failure puts the previous state and memory back, in memory and on
+disk, and the join is abandoned: the node removes its device token and is not joined.
+
+**A second join or a reconnect writes nothing twice.** `team-sync.json` in the node's
+data folder records the hub and the revision it applied; a sync that sees the same pair
+returns `applied: false`. Leaving removes the marker, so joining that hub again applies
+its team afresh.
+
 ```mermaid
 flowchart LR
   U[user on the Mac] --> B[Bots]
@@ -99,6 +142,12 @@ another Bot, `--no-sync` to run tasks only) and stores the replica under
 `<dataDir>/sync/<botId>.json` with mode 0600. The daemon install command carries the
 same `--sync main`.
 
+`node dev/multi-node-sim.mjs` runs the whole path without a model or a key: one hub and
+two nodes as three processes on `127.0.0.1`, each with its own temporary HOME and data
+folder, printing PASS/FAIL per step — discovery, join, allow, the backup, the team, the
+memory, the credentials that stay local, both directions of the conversation, and a
+reconnect that writes nothing twice.
+
 Data lives in `~/.ds-bot/multi-device` unless `--data` or `DSBOT_LAN_DATA` says otherwise.
 
 | File | What it holds |
@@ -114,6 +163,7 @@ Data lives in `~/.ds-bot/multi-device` unless `--data` or `DSBOT_LAN_DATA` says 
 | `worker.js` | Pairing, reconnect loop, execution, file reads and writes, result delivery |
 | `session-sync.js` | The center's revisioned snapshot and the one write path for a node message |
 | `session-client.js` | The node's pull loop, read replica and send that a worker follows |
+| `team-sync.js` | The team bundle, its allowlist, the backup, the apply and its rollback |
 | `daemon.js` | launchd, systemd and Windows logon files, install and status |
 | `tools.js` | The seven Bot tools, the hub's lifecycle and this machine as a node |
 | `sse.js` | The event framing both sides share |

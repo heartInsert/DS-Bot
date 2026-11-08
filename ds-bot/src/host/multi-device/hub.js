@@ -4,7 +4,7 @@
 import { EventEmitter } from 'node:events'
 import { createServer } from 'node:http'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import { createCodeStore, newToken } from './pairing.js'
@@ -33,6 +33,11 @@ const JOIN_KEEP_MS = 2 * 60_000
 const MAX_JOIN_REQUESTS = 8
 const MAX_JOIN_PER_ADDRESS = 3
 const JOIN_WAIT_MAX_MS = 20_000
+const JOIN_FILE = 'join-requests.json'
+// A dual-stack listener reaches an IPv4 client and an IPv6 one; the IPv4-only bind is the
+// fallback for a machine or a container where IPv6 is not available.
+const FAMILY_ERRORS = new Set(['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL', 'EPROTONOSUPPORT'])
+const VIRTUAL_ADAPTER = /(vethernet|hyper-v|vmware|virtualbox|vbox|docker|wsl|loopback|npcap|\btap\b|\btun\b|zerotier|tailscale|utun|vnic|virtual adapter)/i
 
 const TERMINAL = new Set(['done', 'failed', 'rejected', 'timeout', 'cancelled'])
 const terminal = state => TERMINAL.has(state)
@@ -93,14 +98,39 @@ const capped = (value, limit) => {
   return text.length <= limit ? text : `${text.slice(0, limit)}\n[truncated by the hub]`
 }
 
-function lanAddress() {
-  for (const entries of Object.values(networkInterfaces())) {
+function lanAddresses(interfaces = networkInterfaces()) {
+  // A Windows or macOS machine usually has more than one IPv4: a physical adapter plus
+  // Hyper-V, WSL, Docker, VirtualBox or a VPN. The address shown to the user has to be one
+  // the other machine can reach, so the virtual ones only serve as a fallback.
+  const real = []
+  const virtual = []
+  for (const [name, entries] of Object.entries(interfaces)) {
     for (const entry of entries ?? []) {
-      if (entry.family === 'IPv4' && !entry.internal) return entry.address
+      if (entry.family !== 'IPv4' || entry.internal) continue
+      // 169.254/16 is what an adapter reports before DHCP answers.
+      if (entry.address.startsWith('169.254.')) continue
+      if (VIRTUAL_ADAPTER.test(name)) virtual.push(entry.address)
+      else real.push(entry.address)
     }
   }
-  return '127.0.0.1'
+  return [...real, ...virtual]
 }
+
+export function lanAddress(interfaces) {
+  return lanAddresses(interfaces)[0] ?? '127.0.0.1'
+}
+
+// The peer address as one string. A dual-stack listener reports an IPv4 client as
+// `::ffff:a.b.c.d`, and a link-local IPv6 carries its zone, which is this machine's
+// business and never the peer's identity.
+export function normalizeAddress(value) {
+  const text = String(value ?? '').trim()
+  if (text === '') return 'unknown'
+  const plain = text.replace(/^::ffff:/i, '')
+  const zone = plain.indexOf('%')
+  return zone < 0 ? plain : plain.slice(0, zone)
+}
+
 
 function adminToken(dataDir) {
   const file = join(dataDir, 'admin.token')
@@ -122,7 +152,7 @@ function adminToken(dataDir) {
   return { token, file, created: true }
 }
 
-export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS Bot hub', sessionSync, discovery = true, discoveryPort = DISCOVERY_PORT, log = () => {}, now = Date.now } = {}) {
+export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS Bot hub', sessionSync, teamSync, discovery = true, discoveryPort = DISCOVERY_PORT, log = () => {}, now = Date.now } = {}) {
   if (typeof dataDir !== 'string' || dataDir === '') throw new Error('createHub needs a dataDir')
   mkdirSync(dataDir, { recursive: true })
   const registry = createRegistry({ dataDir, now, log })
@@ -197,12 +227,56 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     for (const resolve of set) resolve()
   }
 
+  // A pending request is not a pairing and holds no token, so it is safe to keep on disk.
+  // It has to be: a hub that reloads the plugin (the desktop app restarts, or the user
+  // turns the switch off and on) would otherwise forget the machine that is still waiting
+  // for the Allow button, and the person at the hub would never see it.
+  const joinFile = join(dataDir, JOIN_FILE)
+  function persistJoins() {
+    const requests = [...joins.values()]
+      .filter(entry => entry.status === 'pending')
+      .sort((left, right) => left.createdAtMs - right.createdAtMs)
+      .map(({ token, ...entry }) => entry)
+    try {
+      const payload = `${JSON.stringify({ version: 1, requests }, null, 2)}\n`
+      const temp = `${joinFile}.${process.pid}.tmp`
+      writeFileSync(temp, payload, { mode: 0o600 })
+      renameSync(temp, joinFile)
+    } catch (error) {
+      log('ds-bot lan: could not write %s: %s', joinFile, error.message)
+    }
+  }
+
+  function loadJoins() {
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(joinFile, 'utf8'))
+    } catch {
+      return
+    }
+    const at = now()
+    for (const entry of Array.isArray(parsed?.requests) ? parsed.requests : []) {
+      if (typeof entry?.id !== 'string' || entry.id === '') continue
+      if (!Number.isInteger(entry.expiresAtMs) || at >= entry.expiresAtMs) continue
+      joins.set(entry.id, { ...entry, status: 'pending' })
+    }
+  }
+  loadJoins()
+
   function pruneJoins() {
     const at = now()
+    let changed = false
     for (const request of joins.values()) {
-      if (request.status === 'pending' && at >= request.expiresAtMs) request.status = 'expired'
-      if (request.status !== 'pending' && at - request.createdAtMs > JOIN_KEEP_MS) joins.delete(request.id)
+      if (request.status === 'pending' && at >= request.expiresAtMs) {
+        request.status = 'expired'
+        changed = true
+      }
+      if (request.status !== 'pending' && at - request.createdAtMs > JOIN_KEEP_MS) {
+        joins.delete(request.id)
+        changed = true
+      }
     }
+    if (changed) persistJoins()
   }
 
   function waitJoin(request, waitMs) {
@@ -315,7 +389,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
   }
 
   async function handlePair(request, response) {
-    const address = request.socket.remoteAddress ?? 'unknown'
+    const address = normalizeAddress(request.socket.remoteAddress)
     const failures = (pairFailures.get(address) ?? []).filter(at => now() - at < PAIR_WINDOW_MS)
     if (failures.length >= PAIR_TRIES) {
       pairFailures.set(address, failures)
@@ -351,11 +425,18 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       })
     }
     const device = body.device && typeof body.device === 'object' ? body.device : {}
-    const address = String(request.socket.remoteAddress ?? 'unknown').replace(/^::ffff:/i, '')
+    const address = normalizeAddress(request.socket.remoteAddress)
     const pending = [...joins.values()].filter(entry => entry.status === 'pending')
     // A page that asks twice, or asks again after a lost answer, means the same machine:
-    // it gets the request that is already waiting instead of a second row on the hub.
-    const repeated = pending.find(entry => entry.address === address && (entry.hostname ?? '') === String(device.hostname ?? ''))
+    // it gets the request that is already waiting instead of a second row on the hub. The
+    // hostname and the name the machine reports identify it; its address changes with
+    // DHCP, Wi-Fi versus Ethernet and IPv6 privacy addresses, so it is only the fallback
+    // when the machine sent no hostname.
+    const hostname = typeof device.hostname === 'string' ? device.hostname.trim().toLowerCase() : ''
+    const deviceName = typeof device.name === 'string' ? device.name.trim().toLowerCase() : ''
+    const repeated = pending.find(entry => (hostname !== ''
+      ? String(entry.hostname ?? '').toLowerCase() === hostname && String(entry.name ?? '').toLowerCase() === deviceName
+      : entry.address === address))
     if (repeated !== undefined) {
       return send(response, 200, { ...joinPublic(repeated), requestId: repeated.id, hub: name })
     }
@@ -369,11 +450,19 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     const entry = {
       id: `jr_${randomBytes(9).toString('base64url')}`,
       name: typeof device.name === 'string' && device.name.trim() !== '' ? device.name.trim().slice(0, 40) : nodeName('device'),
-      hostname: typeof device.hostname === 'string' ? device.hostname.slice(0, 120) : undefined,
+      hostname: hostname === '' ? undefined : String(device.hostname).slice(0, 120),
       os: typeof device.os === 'string' ? device.os.slice(0, 40) : undefined,
       arch: typeof device.arch === 'string' ? device.arch.slice(0, 40) : undefined,
       address,
-      device,
+      // Only the fields a hub acts on; the asker does not get to write arbitrary keys into
+      // the hub's data folder.
+      device: {
+        name: typeof device.name === 'string' ? device.name.slice(0, 40) : undefined,
+        hostname: typeof device.hostname === 'string' ? device.hostname.slice(0, 120) : undefined,
+        os: typeof device.os === 'string' ? device.os.slice(0, 40) : undefined,
+        platform: typeof device.platform === 'string' ? device.platform.slice(0, 80) : undefined,
+        arch: typeof device.arch === 'string' ? device.arch.slice(0, 40) : undefined,
+      },
       status: 'pending',
       createdAt: new Date(createdAtMs).toISOString(),
       createdAtMs,
@@ -381,6 +470,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       expiresAtMs: createdAtMs + JOIN_TTL_MS,
     }
     joins.set(entry.id, entry)
+    persistJoins()
     log('ds-bot lan: %s asked to join from %s', entry.name, address)
     events.emit('join', joinPublic(entry))
     return send(response, 200, { ...joinPublic(entry), requestId: entry.id, hub: name })
@@ -476,6 +566,19 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     return send(response, 404, { error: 'not found' })
   }
 
+  // The team a machine joins, not only the address of one: the Bots, group chats,
+  // preferences and memory files (team-sync.js decides which, and leaves credentials and
+  // machine paths behind). The device token authorizes it, like the conversation.
+  async function handleTeam(request, response) {
+    const node = registry.findByToken(bearer(request))
+    if (node === undefined) return send(response, 401, { error: 'the device token is not known to this hub' })
+    if (teamSync === undefined) {
+      return send(response, 503, { error: 'this hub does not share its Bot team' })
+    }
+    registry.touch(node.id)
+    return send(response, 200, await teamSync.snapshot())
+  }
+
   async function handleAdmin(request, response, path) {
     const given = String(request.headers['x-admin-token'] ?? '')
     if (!sameSecret(given, secret.token)) return send(response, 401, { error: 'the admin token is required' })
@@ -527,7 +630,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     const target = new URL(request.url ?? '/', 'http://hub')
     const path = target.pathname
     if (request.method === 'GET' && path === '/health') {
-      return send(response, 200, { ok: true, hub: name, id, version: VERSION, protocol: PROTOCOL, nodes: registry.list().length, session: sessionSync !== undefined })
+      return send(response, 200, { ok: true, hub: name, id, version: VERSION, protocol: PROTOCOL, nodes: registry.list().length, session: sessionSync !== undefined, team: teamSync !== undefined })
     }
     if (request.method === 'POST' && path === '/pair') return handlePair(request, response)
     if (request.method === 'POST' && path === '/join') return handleJoinRequest(request, response)
@@ -542,6 +645,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     }
     if (request.method === 'POST' && path === '/result') return handleResult(request, response)
     if (path === '/session' || path === '/session/bots') return handleSession(request, response, path, target.searchParams)
+    if (path === '/team') return handleTeam(request, response)
     if (path.startsWith('/admin/')) return handleAdmin(request, response, path)
     return send(response, 404, { error: 'not found' })
   }
@@ -605,6 +709,8 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     if (request === undefined || request.status !== 'pending') return false
     const { node, token } = addNode(request.device)
     Object.assign(request, { status: 'approved', token, nodeId: node.id, nodeName: node.name })
+    // The token stays in this process; the file keeps only what is still waiting.
+    persistJoins()
     log('ds-bot lan: allowed %s to join as %s', request.name, node.name)
     events.emit('paired', publicNode(node))
     notifyJoin(request.id)
@@ -616,6 +722,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     const request = joins.get(String(reference ?? ''))
     if (request === undefined || request.status !== 'pending') return false
     request.status = 'denied'
+    persistJoins()
     log('ds-bot lan: denied a join request from %s', request.name)
     notifyJoin(request.id)
     return true
@@ -687,11 +794,26 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
         })
       })
       await new Promise((resolve, reject) => {
-        const failed = error => reject(error)
-        server.once('error', failed)
-        server.listen(port, host, () => {
-          server.off('error', failed)
-          resolve()
+        // A hub on `0.0.0.0` is asked for by machines on the link, and a Mac or a phone
+        // that resolves this machine's name tries IPv6 first. Listening dual-stack means
+        // both families reach the same hub; an IPv4-only fallback keeps a machine without
+        // IPv6 working. An IPv4 client then arrives as `::ffff:a.b.c.d`, which
+        // normalizeAddress folds back to the plain address.
+        const bind = (options, next) => {
+          const onError = error => {
+            server.off('error', onError)
+            next(error)
+          }
+          server.once('error', onError)
+          server.listen(options, () => {
+            server.off('error', onError)
+            resolve()
+          })
+        }
+        if (host !== '0.0.0.0') return bind({ port, host }, reject)
+        bind({ port, host: '::', ipv6Only: false }, error => {
+          if (!FAMILY_ERRORS.has(error?.code)) return reject(error)
+          bind({ port, host: '0.0.0.0' }, reject)
         })
       })
       const address = server.address()

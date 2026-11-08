@@ -1638,6 +1638,11 @@ const HOST_ZH = {
   Leave: '退出',
   Advanced: '高级',
   'Pairing code for the command line': '命令行配对码',
+  'Waiting to join · {count}': '等待加入 · {count}',
+  'Join {name}?': '加入 {name}？',
+  "This computer's Bots, memory and settings are replaced by the hub's. They are backed up first.": '这台电脑的 Bot、记忆和设置会被中心的覆盖；覆盖前先备份。',
+  'Replace and join': '备份并加入',
+  Backup: '备份',
 }
 Object.assign(ZH, HOST_ZH)
 

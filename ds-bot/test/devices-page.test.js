@@ -48,6 +48,17 @@ function render(component, props) {
   return component(props)
 }
 
+// A mounted page keeps its hooks between renders, so a click that sets state can be seen
+// the way a browser would show it.
+function mount(props) {
+  const slots = []
+  const run = () => {
+    current = { index: 0, slots, effects: [] }
+    return DevicesPage(props)
+  }
+  return { tree: run(), again: run }
+}
+
 const texts = (node, found = []) => {
   if (typeof node === 'string' || typeof node === 'number') found.push(String(node))
   if (Array.isArray(node)) node.forEach(item => texts(item, found))
@@ -90,6 +101,22 @@ const findButton = (node, label) => {
 const Frame = ({ label, title, hint, children }) => ({ type: 'row', props: { label, title, hint, children } })
 const Switch = ({ label }) => ({ type: 'switch', props: { label } })
 const page = (roster, actions = {}) => render(DevicesPage, { roster, actions, run: promise => promise, Section: Frame, Row: Frame, Switch })
+
+const findInput = (node) => {
+  if (Array.isArray(node)) {
+    for (const item of node) { const found = findInput(item); if (found !== undefined) return found }
+    return undefined
+  }
+  if (node && typeof node === 'object') {
+    if (node.type === 'input') return node
+    if (typeof node.type === 'function') return findInput(node.type(node.props))
+    for (const key of ['children', 'label', 'title', 'hint']) {
+      const found = node.props?.[key] === undefined ? undefined : findInput(node.props[key])
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
 
 test('the hub page shows the machines, who waits to join, and no command line', () => {
   const roster = {
@@ -259,4 +286,79 @@ test('the sidebar strip copies the shared address', async () => {
   // A loopback server has no address another machine can open, so there is no copy button.
   const local = render(DevicesStrip, { multiDevice: { ...multiDevice, hub: { webUrl: 'http://127.0.0.1:3080' } }, actions: {}, wide: true })
   assert.equal(local.type, 'button')
+})
+
+test('joining asks first: no request is sent until the user replaces the team', async () => {
+  const status = { available: true, enabled: false, hub: { state: 'off' }, nodes: [], requests: [], node: { paired: false } }
+  const joined = []
+  const actions = {
+    multiDeviceStatus: () => Promise.resolve(status),
+    multiDeviceScan: () => Promise.resolve({ hubs: [] }),
+    multiDeviceJoin: url => { joined.push(url); return Promise.resolve(status) },
+  }
+  const mounted = mount({ roster: { multiDevice: status }, actions, run: promise => promise, Section: Frame, Row: Frame, Switch })
+  // The address is the same field a machine with no discovery uses.
+  findButton(mounted.tree, 'Advanced').props.onClick()
+  let tree = mounted.again()
+  findInput(tree).props.onChange({ target: { value: 'http://192.168.1.9:8787' } })
+  tree = mounted.again()
+  findButton(tree, 'Join').props.onClick()
+  tree = mounted.again()
+
+  const asked = texts(tree)
+  assert.ok(asked.includes('Join 192.168.1.9:8787?'))
+  assert.ok(asked.includes("This computer's Bots, memory and settings are replaced by the hub's. They are backed up first."))
+  assert.deepEqual(buttons(tree).filter(label => label === 'Replace and join' || label === 'Cancel'), ['Replace and join', 'Cancel'])
+  assert.deepEqual(joined, [], 'nothing is sent before the second button')
+
+  // Cancel closes the question and sends nothing at all.
+  findButton(tree, 'Cancel').props.onClick()
+  tree = mounted.again()
+  assert.equal(texts(tree).some(text => text.startsWith('Join 192.168.1.9')), false)
+  assert.deepEqual(joined, [])
+
+  // The second button is the one that joins.
+  findButton(tree, 'Join').props.onClick()
+  tree = mounted.again()
+  await findButton(tree, 'Replace and join').props.onClick()
+  assert.deepEqual(joined, ['http://192.168.1.9:8787'])
+})
+
+test('a machine that waits to join is shown even when the hub is not listening yet', () => {
+  const request = { id: 'jr_1', name: 'mac-mini', hostname: 'Mac.lan', os: 'darwin', status: 'pending' }
+  // The seconds after the switch is turned on: the hub is still binding.
+  const starting = page({
+    multiDevice: {
+      available: true,
+      enabled: true,
+      hub: { state: 'starting' },
+      nodes: [],
+      requests: [request],
+      node: { paired: false },
+    },
+  })
+  assert.ok(texts(starting).includes('Waiting to join · 1'))
+  assert.ok(texts(starting).includes('mac-mini wants to join'))
+  assert.deepEqual(buttons(starting).filter(label => label === 'Allow' || label === 'Deny'), ['Allow', 'Deny'])
+
+  // A hub whose switch is off still has to answer the machine that asked.
+  const off = page({
+    multiDevice: { available: true, enabled: false, hub: { state: 'off' }, nodes: [], requests: [request], node: { paired: false } },
+  })
+  assert.ok(texts(off).includes('mac-mini wants to join'))
+})
+
+test('a joined machine shows where its team was backed up', () => {
+  const backup = 'C:\\Users\\me\\.ds-bot\\multi-device\\backups\\join-2026-11-08T10-30-00-000Z'
+  const tree = page({
+    multiDevice: {
+      available: true,
+      enabled: false,
+      hub: { state: 'off' },
+      nodes: [],
+      node: { paired: true, hubName: 'Mac mini', hubUrl: 'http://192.168.1.5:8787', online: true, backup },
+    },
+  })
+  assert.ok(texts(tree).includes('Backup'))
+  assert.ok(texts(tree).includes(backup))
 })

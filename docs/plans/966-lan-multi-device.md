@@ -33,6 +33,18 @@ CEO 的定调：配对不能靠命令行。**中心在 Devices 页开一下，�
 5. **一个中心。** 本机加入别人之后自己不再当 Hub（开关收起，退出加入后恢复）；后台启动时也按这个规则来。`multiDevice: false` 仍是硬关闭，加入也一并不可用。
 6. **验收。** `test/lan-discovery.test.js` 覆盖发现、待批/允许/拒绝、令牌只在允许后出现；`test/lan-join.test.js` 用两个插件 runtime 跑完整路径：中心开 → 节点 `multiDeviceScan` 看见 → `multiDeviceJoin` → 中心 `multiDeviceApproveJoin` → 节点 `online` → 中心派 `echo` 拿到输出 → 退出加入后离线。本机另用「CLI hub 进程 + 节点脚本」两进程复跑过一次，证据在提交说明里。
 
+## v5 做了什么
+
+用户在真机上碰到三件事：Windows 当中心时，Mac 发来的加入请求在中心页面上一直不出现；加入之后 Bot 没有跟着过来；加入前也没有明确提示会覆盖本机的东西。
+
+1. **待批请求落盘，并且不再被藏起来。** 从前的请求只在 Hub 进程内存里，且 `status()` 只在有 Hub 对象时返回；Windows 桌面版重启/更新插件，或开关刚打开还没绑定完，页面就看不到那台正在等待的机器。现在待批请求写进 `<dataDir>/join-requests.json`（只有 pending，没有令牌），Hub 启动时读回，过期和已答复的从文件里删掉；页面上「等待加入」是独立一块，Hub 在 `starting`/`failed`、甚至开关是关的时候也照常显示。
+2. **地址与协议族。** `0.0.0.0` 改成双栈监听（`::` + `ipv6Only:false`，系统没有 IPv6 时回退到纯 IPv4），IPv4 客户端到达时是 `::ffff:a.b.c.d`，`normalizeAddress` 折回纯地址并去掉 `%zone`；页面上展示的地址跳过 Hyper-V / WSL / Docker / VirtualBox / VPN 这类虚拟网卡（Windows 上它们常常排在真实网卡前面），`169.254/16` 也不选。去重键从「地址 + hostname」改成「hostname + 机器名」（大小写不敏感），因为地址会随 DHCP、Wi-Fi/有线、IPv6 隐私地址变化；同一台机器重复请求仍然只有一行。
+3. **加入前确认、先备份。** Devices 页点「加入」只是打开一个问题：「这台电脑的 Bot、记忆和设置会被中心的覆盖；覆盖前先备份。」取消则什么都不发。确认后先把 `state.json` 和整个 `memory/` 复制到 `<dataDir>/backups/join-<ISO 时间>/`，路径写进 status 并在页面上显示；备份失败就直接中止，请求都不会发出去。
+4. **中心权威的团队同步（`team-sync.js`）。** 新增 `GET /team`（设备令牌）：返回中心允许同步的那部分团队。同步范围是白名单，写在代码里（`SYNCED_STATE_KEYS`、`SYNCED_MEMORY_DIRS`、`SYNCED_MEMORY_FILES`）：`bots`、`mainBotIds`、`rooms`、`privateArchives`、`agents`、`capabilities`、`prefs`，以及 `memory/{team,bots,groups}/**`、`memory/journal.jsonl`、`memory/reviewed.json`。不同步的东西也写在代码里（`KEPT_LOCAL_STATE` 和 `team-sync.js` 的清洗规则）：`secrets.json`、任何 `apiKey`/`token`/`secret`/`password` 字段、整个 `multiDevice`（设备 id、端口、加入记录）、`computer` 权限，以及 Bot/群聊的 `workDir`（保留本机原来的）。会话快照和已删除 Bot 的归档也留在中心。
+5. **全有或全无。** `applyTeamBundle` 先写记忆文件，再整体替换白名单里的 state 键，最后经 store 保存一次（锁和外部改动检测仍然生效）。任一步失败就把原来的 state 和记忆放回内存与磁盘，并放弃这次加入：节点删掉刚写下的 `device.json`，状态里说明原因，本机团队不变。
+6. **重复加入与重连幂等。** 节点数据目录里的 `team-sync.json` 记录「哪个中心、哪个 revision 已经应用过」；同一个再来一次返回 `applied:false`，不写任何文件。退出加入会删掉这个标记，所以再加入同一个中心会重新应用一次。启动时如果本机是节点，后台按同样的规则再同步一次（中心不在线就只记一条警告，不影响本机启动）。
+7. **验收。** `dev/multi-node-sim.mjs` 把中心 + 两个节点起成三个独立进程（各自临时 HOME 与数据目录，127.0.0.1 上不同端口），逐步打印 PASS/FAIL：发现、加入、允许、备份、团队、记忆、凭证不外流、两个方向的会话、重连幂等。`test/lan-team-sync.test.js` 覆盖允许清单、密钥排除、备份与回滚、中心重启后请求仍在、过期不能允许、两机去重、加入后团队/记忆/设置一致、备份失败中止加入、IPv4/IPv6 都能连、会话双向。
+
 ## v2 做了什么（六条）
 
 CEO 的定调不变：Mac 是**云中心**，其他机器仍是**出站 worker**；没有公网穿透、TLS 或远程桌面。
@@ -256,8 +268,8 @@ npm run lan:daemon -- uninstall
 
 | 位置 | 内容 |
 |---|---|
-| Hub（插件进程） | `~/.ds-bot/multi-device/nodes.json`、`admin.token`、`hub.json`（CLI 记住的地址）；会话版本只在内存里 |
-| Worker | `device.json`（设备令牌，0600）、`sync/<botId>.json`（会话只读副本，0600，不含令牌） |
+| Hub（插件进程） | `~/.ds-bot/multi-device/nodes.json`、`admin.token`、`hub.json`（CLI 记住的地址）、`join-requests.json`（待批的加入请求，无令牌）；会话版本只在内存里 |
+| Worker | `device.json`（设备令牌，0600）、`sync/<botId>.json`（会话只读副本，0600，不含令牌）、`team-sync.json`（已应用的中心与 revision）、`backups/join-<时间>/`（加入前本机团队与记忆的副本） |
 | 节点（从界面加入） | 本机团队 `state.json` 的 `multiDevice.node`（中心的 URL、名字和节点名，用来重启后继续当节点）；令牌仍在 `device.json` |
 
 ## 怎么用
@@ -429,3 +441,4 @@ node dev/lan-sync-accept.mjs status | stop
 - 2026-11-08：v2 六条（任务 `kind` 与读写文件/传输、平台守护安装、侧栏设备条、审批门槛、路径与 OS 选机、共享地址复制与回环降级）。单测覆盖协议、路径逃逸、大小上限、审批前不派单、守护文件内容与选机纯函数。
 - 2026-11-08：v4 配对不再依赖命令行：UDP 发现（8789）、待批的加入请求与中心页面的「允许/拒绝」、安装版节点在插件进程里跑 worker、Devices 页精简为「这台电脑 / 已配对设备 / 附近的中心」，命令收进高级。
 - 2026-11-08：v3 中心权威间歇同步（Hub 的 `/session` 拉取与推送、`epoch`+`revision` 游标、节点只读副本、断线补拉、`lan:say`、`--sync` 与守护命令默认同步、`dev/lan-sync-accept.mjs sync` 验收）。旧的“浏览器打开同一 Web 页”保留为完整界面，不再当作配对节点之间的同步协议。
+- 2026-11-08：v5（Windows 中心的加入请求不出现、加入后团队没有跟过来）——待批请求落盘并在页面上独立显示、双栈监听与虚拟网卡过滤、加入前确认与时间戳备份、`GET /team` 的白名单团队同步、回滚与重连幂等、`dev/multi-node-sim.mjs`。
