@@ -9,7 +9,7 @@ import { build } from 'esbuild'
 // idempotency key until the send succeeds) is testable.
 const { outputFiles } = await build({
   stdin: {
-    contents: "export { HubChat, hubRows, applyHubReply, HUB_CHAT_CSS } from './src/client/hub-chat.js'\nexport { conversationLeft } from './src/client/frame-layout.js'",
+    contents: "export { HubChat, hubRows, applyHubReply, prependEarlier, HUB_CHAT_CSS } from './src/client/hub-chat.js'\nexport { conversationLeft } from './src/client/frame-layout.js'",
     resolveDir: fileURLToPath(new URL('..', import.meta.url)),
   },
   bundle: true, format: 'cjs', platform: 'node', write: false,
@@ -54,7 +54,7 @@ runInNewContext(outputFiles[0].text, {
   setInterval: (fn) => { intervalCallbacks.push(fn); return intervalCallbacks.length }, clearInterval: () => {},
   Intl, Date, URL, URLSearchParams, TextEncoder,
 })
-const { HubChat, hubRows, applyHubReply, HUB_CHAT_CSS, conversationLeft } = module.exports
+const { HubChat, hubRows, applyHubReply, prependEarlier, HUB_CHAT_CSS, conversationLeft } = module.exports
 
 // A fresh component instance: state, refs, effects and timers reset, indices begin at zero.
 const fresh = () => { stateCells = []; refCells = []; effectCells = []; intervalCallbacks = [] }
@@ -62,6 +62,7 @@ const fresh = () => { stateCells = []; refCells = []; effectCells = []; interval
 const minimalActions = () => ({
   hubChat: () => new Promise(() => {}),
   hubSend: () => new Promise(() => {}),
+  hubEarlier: () => new Promise(() => {}),
   closeHubChat: () => {},
 })
 
@@ -175,8 +176,8 @@ test('an unchanged reply keeps the items and advances the cursor', () => {
 })
 
 test('a full reply replaces the items and an offline reply keeps its flag', () => {
-  assert.deepEqual(plain(applyHubReply(null, { epoch: 'e1', revision: 3, offline: false, items: [{ id: 'a' }] }).view), { offline: false, items: [{ id: 'a' }] })
-  assert.deepEqual(plain(applyHubReply({ offline: false, items: [] }, { unchanged: true, offline: true, epoch: 'e1', revision: 3 }).view), { offline: true, items: [] })
+  assert.deepEqual(plain(applyHubReply(null, { epoch: 'e1', revision: 3, offline: false, items: [{ id: 'a' }] }).view), { offline: false, items: [{ id: 'a' }], earlier: null })
+  assert.deepEqual(plain(applyHubReply({ offline: false, items: [] }, { unchanged: true, offline: true, epoch: 'e1', revision: 3 }).view), { offline: true, items: [], earlier: null })
 })
 
 test('the poll sends the cursor it received so an unchanged reply stays cheap', async () => {
@@ -220,4 +221,62 @@ test('a Bot reply renders through the shared markdown helper', async () => {
   const marks = collect(tree, node => node.type === 'MarkdownText')
   assert.equal(marks.length, 1)
   assert.equal(marks[0].props.text, '**done**')
+})
+
+test('a settled question, a closed view and an answered question render read-only', async () => {
+  fresh()
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [
+    { id: 'q1', kind: 'closed', question: { question: 'Approve?', options: ['Yes', 'No'] }, closed: 'dismissed' },
+    { id: 'v1', kind: 'closed', view: {}, title: 'A report', closed: 'dismissed' },
+    { id: 'a1', kind: 'answer', questions: [{ id: 'q2', question: 'Which?', options: ['A', 'B'] }], answers: [{ id: 'q2', selected: ['A'] }] },
+  ] })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const settled = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-q-settled'))
+  assert.equal(settled.length, 3, 'the closed question, closed view and answered question all render as settled cards')
+  // The read-only card names the question, and its options are not live buttons.
+  assert.equal(settled[0].props['aria-label'], 'Approve?')
+  assert.equal(collect(tree, node => node.type === 'button' && String(node.props.className ?? '').includes('bt-q-opt')).length, 0, 'no live option buttons on a read-only card')
+})
+
+test('prependEarlier prepends an earlier page and de-dupes it by id', () => {
+  const earlier = [{ id: 'a', kind: 'user', text: 'old' }, { id: 'b', kind: 'bot', text: 'reply' }]
+  const held = [{ id: 'b', kind: 'bot', text: 'reply' }, { id: 'c', kind: 'user', text: 'new' }]
+  assert.deepEqual(plain(prependEarlier(held, earlier)), [{ id: 'a', kind: 'user', text: 'old' }, { id: 'b', kind: 'bot', text: 'reply' }, { id: 'c', kind: 'user', text: 'new' }])
+  assert.deepEqual(plain(prependEarlier(undefined, earlier)), earlier)
+  assert.deepEqual(plain(prependEarlier(held, undefined)), held)
+})
+
+test('the Load earlier button appears when the reply carries a paging cursor', async () => {
+  fresh()
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, earlier: { part: 1, beforeSeq: 40 }, items: [{ id: 'a', kind: 'user', text: 'hi' }] })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const button = find(tree, node => node.type === 'button' && String(node.props.className ?? '').includes('bt-hub-earlier-btn'))
+  assert.ok(button, 'a Load earlier button is shown')
+})
+
+test('Load earlier prepends the returned page and calls the action once', async () => {
+  fresh()
+  const called = []
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, earlier: { beforeSeq: 10 }, items: [{ id: 'b', kind: 'user', text: 'new' }] })
+  actions.hubEarlier = () => { called.push(1); return Promise.resolve({ items: [{ id: 'a', kind: 'user', text: 'old' }], cursor: null }) }
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const button = find(tree, node => node.type === 'button' && String(node.props.className ?? '').includes('bt-hub-earlier-btn'))
+  button.props.onClick()
+  await flush()
+  tree = renderHubChat({ actions })
+  assert.equal(called.length, 1)
+  const rows = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-hub-user'))
+  assert.equal(rows.length, 2, 'the earlier message is prepended before the tail')
 })

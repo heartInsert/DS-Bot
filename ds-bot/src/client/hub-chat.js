@@ -11,6 +11,7 @@
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { MarkdownText } from './dsh-primitives.js'
 import { CloseIcon } from './icons.js'
+import { SettledQuestion, AnsweredCell } from './questions.js'
 import { t } from './i18n.js'
 
 const POLL_MS = 1000
@@ -39,13 +40,38 @@ export function hubRows(items, pending) {
 // How a hub-chat reply updates the held view. A full answer replaces the items and
 // advances the cursor; an "unchanged" answer carries no items and only refreshes the
 // online flag, so the poll stays cheap. The cursor is null until a reply names an epoch.
+// `earlier` is the paging cursor for "Load earlier"; it rides the snapshot so the view
+// knows whether more history exists.
 export function applyHubReply(view, reply) {
   const cursor = typeof reply?.epoch === 'string' ? { epoch: reply.epoch, revision: reply.revision } : null
+  const earlier = reply?.earlier ?? null
   const offline = reply?.offline === true
   if (reply?.unchanged === true) {
-    return { view: { ...(view ?? { items: [] }), offline }, cursor }
+    return { view: { ...(view ?? { items: [] }), offline, earlier: view?.earlier ?? earlier }, cursor }
   }
-  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [] }, cursor }
+  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [], earlier }, cursor }
+}
+
+// Prepend an earlier page to the held items, de-duped by the stable id every item
+// carries, so a page that overlaps the tail never doubles a message.
+export function prependEarlier(items, earlierItems) {
+  const current = Array.isArray(items) ? items : []
+  const incoming = Array.isArray(earlierItems) ? earlierItems : []
+  const seen = new Set()
+  const out = []
+  for (const item of incoming) {
+    if (item?.id === undefined || !seen.has(item.id)) {
+      out.push(item)
+      if (item?.id !== undefined) seen.add(item.id)
+    }
+  }
+  for (const item of current) {
+    if (item?.id === undefined || !seen.has(item.id)) {
+      out.push(item)
+      if (item?.id !== undefined) seen.add(item.id)
+    }
+  }
+  return out
 }
 
 // A reply's markdown, through the same renderer the main conversation uses.
@@ -54,8 +80,10 @@ function Text({ text }) {
 }
 
 // A conversation item the hub served: a user message, a Bot reply, a group post, an
-// event line or a divider. Rendered with the same markdown helper the live view uses;
-// the rich cells belong to the live DSH view and are not needed for a node's replica.
+// event line or a divider. Rendered with the same markdown helper the live view uses.
+// Settled question and view cards are drawn with the same read-only components the
+// main conversation uses for history; the live approval card is not in the snapshot
+// (it lives in the hub's work state) and stays a gap for now.
 function Row({ item }) {
   const kind = item?.kind
   if (kind === 'divider') {
@@ -78,6 +106,20 @@ function Row({ item }) {
     return h('div', { className: 'bt-hub-row bt-hub-user', 'data-pending': item.pending === true || undefined },
       h('div', { className: 'bt-hub-bubble' }, h(Text, { text: item.text })))
   }
+  // A question answered by a message, or a view/handoff answer whose reply text is the
+  // settled card. The same component the history view draws for a settled answer.
+  if (kind === 'answer') {
+    return h(AnsweredCell, { node: { data: item } })
+  }
+  // A question or view card closed without an answer on it: the settled card, read-only.
+  if (kind === 'closed') {
+    if (item.question !== undefined) {
+      return h('div', { className: 'bt-hub-card' }, h(SettledQuestion, { question: item.question, closed: item.closed }))
+    }
+    if (item.view !== undefined) {
+      return h('div', { className: 'bt-hub-card' }, h(SettledQuestion, { question: { question: item.title || t('View') }, closed: item.closed }))
+    }
+  }
   return null
 }
 
@@ -85,6 +127,7 @@ export function HubChat({ id, kind, name, left, actions }) {
   const [view, setView] = useState(null)
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
   const [error, setError] = useState(null)
   const [pending, setPending] = useState(null)
   // The replica's cursor, sent back so an unchanged poll answers without the item list.
@@ -93,6 +136,9 @@ export function HubChat({ id, kind, name, left, actions }) {
   // the freshest items without re-subscribing the poll to them.
   const viewRef = useRef(null)
   const listRef = useRef(null)
+  // How far from the top the reader is, set before an earlier page is prepended so the
+  // scroll position can be restored after the content above grows.
+  const anchorRef = useRef(null)
 
   const refresh = useCallback(() => {
     const cursor = cursorRef.current
@@ -117,8 +163,34 @@ export function HubChat({ id, kind, name, left, actions }) {
   useEffect(() => {
     const list = listRef.current
     if (list === null) return
-    list.scrollTop = list.scrollHeight
+    // A page of earlier items was prepended: keep the content the reader was on in
+    // place instead of jumping to the bottom. Otherwise a new message scrolls to it.
+    if (anchorRef.current !== null) {
+      list.scrollTop = list.scrollHeight - anchorRef.current
+      anchorRef.current = null
+    } else {
+      list.scrollTop = list.scrollHeight
+    }
   }, [view?.items?.length, pending])
+
+  const loadEarlier = () => {
+    if (loadingEarlier) return
+    setLoadingEarlier(true)
+    setError(null)
+    const list = listRef.current
+    if (list !== null) anchorRef.current = list.scrollHeight - list.scrollTop
+    void Promise.resolve(actions.hubEarlier(id, kind)).then(reply => {
+      const earlierItems = Array.isArray(reply?.items) ? reply.items : []
+      const merged = prependEarlier(viewRef.current?.items, earlierItems)
+      const next = { ...(viewRef.current ?? { items: [] }), items: merged, earlier: reply?.cursor ?? null }
+      viewRef.current = next
+      setView(next)
+      setLoadingEarlier(false)
+    }, reason => {
+      setLoadingEarlier(false)
+      setError(reason?.message ?? String(reason))
+    })
+  }
 
   const send = () => {
     const value = text.trim()
@@ -152,6 +224,8 @@ export function HubChat({ id, kind, name, left, actions }) {
       offline ? h('span', { className: 'bt-hub-offline' }, t('Offline — messages are not sent')) : null,
       h('button', { type: 'button', className: 'bt-hub-close', 'aria-label': t('Close'), onClick: () => actions.closeHubChat() }, h(CloseIcon))),
     h('div', { className: 'bt-hub-body', ref: listRef },
+      view?.earlier ? h('div', { className: 'bt-hub-earlier' },
+        h('button', { type: 'button', className: 'bt-hub-earlier-btn', disabled: loadingEarlier, onClick: loadEarlier }, loadingEarlier ? '…' : t('Load earlier'))) : null,
       error === null ? null : h('div', { className: 'bt-hub-error' }, error),
       offline && items.length === 0 ? h('div', { className: 'bt-hub-empty' }, t('This computer is not connected to the hub.')) : null,
       items.map((item, index) => h(Row, { key: itemKey(item, index), item }))),
@@ -192,6 +266,11 @@ export const HUB_CHAT_CSS = `
 .bt-hub-bot .bt-hub-bubble{background:var(--bt-card);border:.5px solid var(--bt-line)}
 .bt-hub-divider{align-self:center;font-size:11px;color:var(--bt-ink-3)}
 .bt-hub-event{align-self:center;font-size:12px;color:var(--bt-ink-2)}
+.bt-hub-card{flex:none;width:100%}
+.bt-hub-earlier{align-self:center;flex:none}
+.bt-hub-earlier-btn{padding:6px 14px;border-radius:999px;border:0;background:var(--bt-hover);color:var(--bt-ink-2);font:inherit;font-size:12px;cursor:pointer}
+.bt-hub-earlier-btn:hover{background:var(--bt-active);color:var(--bt-ink)}
+.bt-hub-earlier-btn:disabled{opacity:.5;cursor:default}
 .bt-hub-empty{align-self:center;margin:auto;font-size:13px;color:var(--bt-ink-2)}
 .bt-hub-error{align-self:center;font-size:13px;color:var(--bt-danger)}
 .bt-hub-composer{display:flex;align-items:flex-end;gap:8px;padding:12px 16px;border-top:.5px solid var(--bt-line)}

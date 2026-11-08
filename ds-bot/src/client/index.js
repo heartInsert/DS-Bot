@@ -504,6 +504,7 @@ export function apply(ctx) {
     // answer "unchanged" without the item list when nothing has moved.
     hubChat: (id, kind, cursor) => call('hub-chat', { ...(kind === 'room' ? { roomId: id } : { botId: id }), ...(cursor?.epoch !== undefined ? { epoch: cursor.epoch, since: cursor.revision } : {}) }),
     hubSend: (id, kind, text, messageId) => call('hub-send', { ...(kind === 'room' ? { roomId: id } : { botId: id }), text, messageId }),
+    hubEarlier: (id, kind) => call('hub-earlier', { ...(kind === 'room' ? { roomId: id } : { botId: id }) }),
     openHubChat: (id, kind, name) => ui.set(state => ({ ...state, hubChat: { id, kind, name }, details: null, view: 'details', renaming: false, tab: null, newChat: null, exchange: null, menu: null, palette: null })),
     closeHubChat: () => ui.set(state => (state.hubChat === null ? state : { ...state, hubChat: null })),
     openSession: (id) => {

@@ -335,7 +335,7 @@ Bot 会 `device_transfer`：先 `put`（审批卡），需要时再 `get` 回来
 - 不做多 Hub、跨网段穿透、TLS 与账号体系。
 - 不做交互式命令、实时任务日志、断点续传或超过 1 MiB 的单文件；也不做按 Bot 细分的设备权限。
 - 不让节点跑第二份 DSH，也不做双写或离线合并：会话始终由中心写，节点只有只读副本。
-- 不同步全部历史：`/session` 只给当前 part 的尾部；更早的分页仍走浏览器或 `earlier`。
+- 不同步全部历史：`/session` 只给当前 part 的尾部；更早的分页走 `GET /session?before=`（v7，见下），不再依赖浏览器。
 - 不把 Worker 塞进 DSH 插件：Windows 只需要 Node，不需要 DSH 和 DS Bot。
 
 ## 已知限制
@@ -349,7 +349,7 @@ Bot 会 `device_transfer`：先 `put`（审批卡），需要时再 `get` 回来
 - 一台 Worker 串行执行；大文件传输会占住该节点，其他任务排队。
 - 工具默认最多等 20 秒；长命令和大文件要靠 `device_task` 续读。
 - 会话同步只覆盖一个 Bot 的当前 part；节点跟着 `sync/<botId>.json` 里的那个 Bot，不切换 part，也不接收审批卡交互。
-- 去重用的 `messageId` 只在 Hub 进程内存里：Hub 重启后，同一条重试可能写两次。正常网络下客户端不会重发已成功的那条。
+- 去重用的 `messageId` 已落盘（见 v7）：Hub 重启后同一条重试仍然只写一次；只有在「pending 已写、写未发生」这个窗口崩溃且会话里恰好有同文本的用户消息时，才可能被误判为已写而丢一条（仍是 at-most-once，绝不重跑模型回合）。
 - 共享会话的完整界面仍依赖中心的 DSH Web 或端口转发；Devices 页只能复制 Web origin，带 token 的登录链接仍要看 DSH 启动时的输出。
 
 ## 为什么还需要 DSH 的能力（v3 不依赖）
@@ -443,6 +443,7 @@ node dev/lan-sync-accept.mjs status | stop
 - 2026-11-08：v3 中心权威间歇同步（Hub 的 `/session` 拉取与推送、`epoch`+`revision` 游标、节点只读副本、断线补拉、`lan:say`、`--sync` 与守护命令默认同步、`dev/lan-sync-accept.mjs sync` 验收）。旧的“浏览器打开同一 Web 页”保留为完整界面，不再当作配对节点之间的同步协议。
 - 2026-11-08：v5（Windows 中心的加入请求不出现、加入后团队没有跟过来）——待批请求落盘并在页面上独立显示、双栈监听与虚拟网卡过滤、加入前确认与时间戳备份、`GET /team` 的白名单团队同步、回滚与重连幂等、`dev/multi-node-sim.mjs`。
 - 2026-11-08：v6（节点界面渲染中心会话）——`/session` 从「只跟一个 Bot」扩展成「每个会话一个游标」，覆盖每个 Bot 私聊和每个群聊；节点侧 `session-client` 支持切换会话、按 id 去重、离线状态与拒绝发送；加入后节点按计时器重读 `/team`，中心新增/改名/删除的 Bot 与群聊持续同步过来。中心会话视图摆在会话区（不盖侧栏）、发送从界面就带幂等 id 且乐观对账、`hub-chat` 按游标回 `unchanged` 让轮询变便宜、回复复用主会话的 `MarkdownText`。
+- 2026-11-08：v7（Hub 侧持久化发送去重）——接受过的 `messageId` 落盘到 `<dataDir>/send-dedupe.json`（原子写、0600、按会话分组、7 天 / 每会话 1000 / 全局 10000 的保留策略）；写入前落 pending、写入后落 committed，重启后按「会话尾部是否有同文本用户消息」对账，写清唯一的重复/丢失窗口并坚持 at-most-once（绝不重跑模型回合）；并发同 id 由 in-flight 收敛到一次写。`test/lan-send-dedupe.test.js` 覆盖重启去重、保留剪枝、损坏文件、崩溃对账与并发。
 
 ## v6 做了什么（节点界面渲染中心会话，长期设计）
 
@@ -499,3 +500,121 @@ v5 的 `GET /team` 只在加入时应用一次；v6 在节点上加了计时器�
 `test/lan-conversation-sync.test.js` 用 mock 团队覆盖十条：Bot 私聊与群聊的首次历史读取、中心→节点与节点→中心双向、回复分步流式到节点直到完成、节点切换 Bot/群聊、同幂等键只落一条、断线重连按游标补齐且无重复、中心重启换 epoch 后节点重拍、中心离线明确状态并拒绝发送、中心清单变化传播到节点、重连不重放副作用回合。协议层不需要 DSH 和模型密钥；界面层用两个隔离实例 + mock 模型的双实例浏览器证据。
 
 界面与节点侧的新一轮补了两个测试文件：`test/hub-chat.test.js` 覆盖客户端——会话区左边缘随侧栏模式变化（开/轨道/隐藏/抽屉）、CSS 不再整窗固定、双击只发一个消息 id、失败重试复用同一 id、乐观待发行按 id 让位不重复、离线禁用输入框、`unchanged` 游标保持条目、Bot 回复走 `MarkdownText`；`test/lan-hub-chat.test.js` 覆盖节点侧——`hubChatAnswer` 只在游标命中时回 `unchanged`、`readHubChat` 先给历史再按游标回 `unchanged`、`sendHubChat` 把 `messageId` 原样转发且重试只写一条。真实浏览器的双机验收仍按上面的双机清单执行。
+
+## v7 做了什么（Hub 侧持久化发送去重，长期设计）
+
+v6 的去重 `messageId` 只在 Hub 进程内存里：Hub 一重启（桌面应用重启、开关关了再开），同一条重试就可能写两次。用户的要求是「重试同一条 messageId 在 Hub 重启后只写一次，而且回的是同一条结果（幂等响应），不是简单地当作丢包」。v7 把接受过的 id 落盘到 Hub 数据目录，并把崩溃窗口写清楚。
+
+### 落盘的内容与位置
+
+- 文件：`<dataDir>/send-dedupe.json`（`SEND_LOG_FILE`），和 `nodes.json`、`admin.token` 同目录；原子写（先写 `<file>.<pid>.tmp` 再 `rename`），0600。
+- 结构按会话分组（`bot:<id>` / `room:<id>`），每个 id 记 `{id, text, at, state, epoch, revision, acceptedAt}`：`state` 是 `pending`（写入前）或 `committed`（写入后），`epoch`+`revision`+`acceptedAt` 是写入结果，重试时原样返回。
+- 保留策略：每条 7 天（`SEND_ID_TTL_MS`），每个会话最多 1000 条（`MAX_IDS_PER_CONVERSATION`），全局最多 10000 条（`MAX_TOTAL_IDS`）；写时剪枝，启动时按同一套规则读回。选择 7 天 + 每会话 1000：覆盖一台机器周末离线再回来的场景，又保证文件不会因日常发送无界增长。
+
+### 崩溃边界（写清哪个窗口会重复或丢失）
+
+发送走同一条 `rt.sendUser` 路径，唯一有副作用的动作是把用户消息写进 Session（`ctx.sessionController.prompt`）。`messageId` **不**存在消息里，所以重启后不能靠 id 反查；改用「看会话当前尾部有没有同文本的用户消息」来判定。
+
+顺序是：
+
+1. **先落 pending**（同步写盘）→ 2. `rt.sendUser` 写 Session → 3. **后落 committed**（同步写盘）。
+
+重启时对每个 pending 做一次对账：
+
+- 会话尾部找到同文本的用户消息 → 判定**已写**，改成 committed；重试返回 `duplicate: true` 和原来的结果，不重写。
+- 找不到 → 判定**未写**，丢掉 pending；重试正常写一次。
+
+由此，可能重复或丢失的窗口只剩一个：**写已发生、但对账时那条消息已经滚出当前 part 的尾部**（或对账时恰好有另一条同文本消息）。这时会被误判成「未写」，重试再写一条 → 重复一条。反之，写未发生但尾部已有同文本的旧消息，会被误判成「已写」→ 丢一条。两种都只涉及普通用户消息，**绝不重跑模型回合、绝不自动重放任何有副作用的工具**（at-most-once for model turns）：pending 的判定只会让重试「再写一条」或「返回已接受」，Hub 自己从不去执行模型回合。
+
+### 并发
+
+同一 id 的两条在途请求由 `inflight` 收敛到同一个 Promise：后到者等待先到者，写一次。不同会话的 id 互不干扰（键是 `会话 + id`）。
+
+### 验收
+
+`test/lan-send-dedupe.test.js` 覆盖十条：Hub 重启后同 id 只写一次且返回同一 `acceptedAt`、不同 id 写两条、同 id 在 bot 与 room 里各写一条、每会话只留最新 N 条、超 7 天被丢弃、损坏文件从空开始且继续可用、pending 且已写→对账为已写、pending 且未写→丢弃并让重试写一次、两条并发同 id 只写一条、落盘文件的原子写与引用字段。协议层不需要 DSH 和模型密钥。
+
+## v7 gaps: cards（节点侧的审批/问题/工具卡）
+
+节点聊天界面 `src/client/hub-chat.js` 只渲染 `divider`/`event`/`post`/`bot`/`user`，审批卡、问题卡、工具卡都不显示，节点用户看不到、也就没法操作。这一节把「哪些组件能渲染它们、哪些端点能解决它们、要补什么」写清楚。
+
+### 现状：卡片与端点
+
+**快照里到底有什么。** `/session` 的 `items` 来自 `parts.js` 的 `displayItems`（`chatPage`/`roomPage` 共用），它只产出这几种：`user`、`bot`、`post`、`event`、`relay`、`answer`、`closed`、`view`、`divider`。其中与卡片相关的是：
+
+- `ask_user` 的问题卡：已关闭的卡片以 `closed` 行出现（`parts.js:1446`，带 `question` 和 `closed`）；已回答的以 `answer` 行出现（`parts.js:1487`，带 `questions`/`answers`）。
+- `show_view` 的视图卡：纯展示的以 `view` 行出现（`parts.js:1452`，带 `title`/`view`）；关闭或已答的以 `closed`（带 `view`）或 `answer`（带 `views`/`answers`）出现。
+- `group_relay` 的群回合结果以 `relay`/`post`/`user` 行出现（`parts.js:1471-1473`）。
+
+**审批卡不在快照里。** 审批是活的 DSH 状态：`approvals.js` 在 `ctx.on('approval/request', ...)` 里把每个待批请求收进内存 `pending` Map，`approvalsView()` 把它放进 `/api/bot` 的 live 回答（`channel.js:107` 的 `work.approvals`），从不进入 `displayItems`。所以节点要看到审批卡，必须让 Hub 在快照里额外带一份审批视图——这是协议改动，不是纯渲染。
+
+**渲染这些卡的组件（主会话在用的）：**
+
+| 卡片 | 组件 | 文件 |
+|---|---|---|
+| 待批问题（`ask_user`） | `PendingQuestion` | `src/client/questions.js:188` |
+| 已关闭问题（只读） | `SettledQuestion` | `src/client/questions.js:149` |
+| 已答问题（只读） | `AnsweredCell`（经 `AnsweredReply` 分派） | `src/client/questions.js:226` |
+| 待批/纯展示视图（`show_view`） | `WidgetCell` / `PendingView` / `Card`（`deep-view/react`） | `src/client/widget-cell.js:51` |
+| 已关闭视图（只读） | `ClosedView`（就是 `SettledQuestion` 包一层标题） | `src/client/widget-cell.js:78` |
+| 已答视图（只读） | `AnsweredView`（经 `AnsweredReply` 分派） | `src/client/widget-cell.js:93` |
+| 审批队列（Allow once / Reject） | `ApprovalQueue` / `ApprovalCard` | `src/client/approval-queue.js:87,120` |
+| 一般工具调用/结果 | `ToolCell`（读活 DSH 投影 `node.data.root`，不在快照里） | `src/client/cells.js:1163` |
+
+**解决这些卡的端点（`/api/bot`，`channel.js` 的路由）：**
+
+- 审批：`approval-answer` → `rt.answerApproval(id, choice)`（`channel.js:385`，`approvals.js:100`）。`approval/request` 是 DSH 钩子，不是 HTTP 端点。
+- 问题：`answer-question` → `rt.answerQuestion(sessionId, questionId, answer)`（`channel.js:474` → `channel.js:720`）；`dismiss-question`（`channel.js:411`）。
+- 视图：`view-reply` → `rt` 的 `viewReply`（`channel.js:479`）。
+- 节点对 Hub 的通道：`hub-chat` / `hub-send`（`channel.js:672-675` → `tools.js` 的 `multiDeviceHubConversation` / `multiDeviceHubSend`）。
+
+### 本轮已做：只读渲染问题卡与关闭的视图卡
+
+`hub-chat.js` 的 `Row` 现在补了三种只读渲染，复用主会话历史用的同一组件：
+
+- `answer` → `AnsweredCell`（`questions.js`）：已答问题显示成「问题 + 选项带字母 + 用户选中的答案」；视图/交接的答复则退回显示答复文本。
+- `closed` 且带 `question` → `SettledQuestion`：关闭的问题卡，带 `closedLabel` 徽标。
+- `closed` 且带 `view` → `SettledQuestion`（标题当问题）：等价于主会话的 `ClosedView`。
+
+这些卡片是快照里本来就有、且已经「关闭/已答」的，天然只读，复用 `questions.js` 的纯组件即可，不需要 `deep-view`。CSS 就是全局 `styles.js` 里的 `bt-q*`。测试：`test/hub-chat.test.js` 新增一条——关闭的问题、关闭的视图、已答的问题都渲染成 `.bt-q-settled` 只读卡，且没有活选项按钮。
+
+### 仍缺的（精确列出，含步骤）
+
+**1. 纯展示视图 `view` 行（show_view 的 `await_reply:false` 展示卡）。** `displayItems` 把这类卡放进 `view` 行（带 `title`/`view`），但 `Row` 还没处理它。要渲染它得用 `widget-cell.js` 的 `WidgetCell`（`done:true` 路径）或其底层 `Card`（`deep-view/react` 的 `WidgetCard`），这会把 `deep-view/react`、`handoff-card.js`、`computer.js` 拽进 hub-chat 的依赖和测试 bundle。步骤：`hub-chat.js` `Row` 加 `kind === 'view'` 分支，用 `WidgetCell({ done:true, args:{ text: n=>n==='title'?item.title:undefined, value: n=>n==='view'?item.view:undefined } })`；把 `HUB_CHAT_CSS` 与 `widget-cell.js` 的 `WIDGET_CSS` 一起注入；在 `hub-chat.test.js` 的 esbuild 里 external 掉 `deep-view/react` 并在 react stand-in 补 `deep-view` 桩。
+
+**2. 审批卡的只读渲染 + 转发。** 审批不在快照里。步骤：(a) `session-sync.js` 的 `render`/`viewOf` 把 `rt.approvalsView()` 里属于该会话的审批（按 `sessionId`/`roomId`）加进快照（`approval` 行，带 `id`/`tool`/`reason`/`detail`/`botId`/`answerable`）；(b) 节点 `hub-chat.js` 用 `ApprovalCard` 的只读变体渲染；(c) 转发：新增 Hub 端点 `POST /session/approval`（`{approvalId, choice}`，设备令牌鉴权，按审批 id 幂等，已过期/已解决回明确结果），Hub 侧 `sessionSync` 拿到后调 `rt.answerApproval`（与 `approval-answer` 同一条路径）。关键约束：**永远不重放工具**——审批转发只调 `answerApproval`，它要么解决一个仍在 `pending` 的请求，要么报 `bot/stale`，不会执行任何工具。
+
+**3. 节点侧交互卡的端到端转发。** 问题/视图的「回答/驳回」要从节点经设备令牌转发到 Hub：新增 Hub 端点（如 `POST /session/question`、`POST /session/view`），按卡片 id 幂等；节点 `hub-chat.js` 的 `actions` 里把 `answerQuestion`/`dismissQuestion`/`answerView` 改成走 `hub-send` 一类的转发端点而不是本机 `/api/bot`。已过期/已解决 → 回明确结果并把卡片变只读，绝不重执行。
+
+**4. `relay` 行（群回合事件）。** 快照里的 `relay` 行（`reply.kind`：`approval`/`working`/`done`/`stopped`/`failed` 等）当前不渲染。主会话用 `cells.js` 的 `RelayEvent`（`cells.js:920`）。步骤：`Row` 加 `relay` 分支；`RelayEvent` 依赖 `roster`/`actions`（打开成员、展示详情），只读版可以只显示事件文本（`{name} 开始/等待审批/完成`），不接 `actions`。
+
+### 结论
+
+「只读渲染问题卡与关闭视图卡」本轮已落地（小且安全）。审批卡的只读显示和 approve/deny/answer 转发、纯展示 `show_view` 卡、`relay` 事件行都还是缺口：前两者要动协议（快照带审批、新转发端点）并牵出 `deep-view` 依赖，属「非小改动」，留待后续按上面步骤做。
+
+## v7: 加载更早的消息（Load earlier）
+
+`/session` 只给当前 part 的尾部（最多 200 条 / 约 1.5 MiB），更早的内容此前只能靠中心的 DSH Web。v7 给 Hub 加了分页，节点界面就能像主会话一样「Load earlier」。
+
+### 协议
+
+快照本来就把 `chatPage`/`roomPage` 的分页游标原样带出来了（`session-sync.js` 的 `render` → `viewOf` 的 `cursor` 字段），只是节点没用。现在：
+
+- `GET /session?bot=<id>&before=<cursor|seq|id>`：`before` 是三种之一——上次快照给的分页游标（`{part, beforeSeq}`，JSON 编码）、一个裸 `seq`、或一条稳定 id（`session:seq:n`，取其中的 `seq`）。后两种在当前 part 内往前翻；游标形式能跨进更早的 part。
+- Hub 端 `sessionSync.earlier(reference, { before })` 把 `before` 交给同一个 `chatPage(botId, cursor)` / `roomPage(roomId, cursor)`，所以更早的 part 和 part 分界线跟主会话完全一致；返回 `{epoch, botId|roomId, sessionId, items, cursor}`，`items` 已打稳定 id，`cursor` 是下一页的游标（`null` = 到头）。
+
+### 节点
+
+`session-client` 把快照里的 `cursor` 存进副本，新增 `earlier(reference)`：带上副本游标发 `GET /session?before=`，把返回页用 `mergeItems` **按 id 去重地前插**到副本，并把副本游标推进到下一页。节点 `/api/bot` 通道新增 `hub-earlier` 端点（`channel.js` → `tools.js` 的 `multiDeviceHubEarlier` → `readHubEarlier`）。
+
+### 界面
+
+`hub-chat.js` 的 `applyHubReply` 现在把快照的 `earlier` 游标带进视图；有游标就显示「Load earlier」按钮，点击调 `actions.hubEarlier`，返回页用 `prependEarlier`（按 id 去重前插）合并，游标到头后按钮消失。滚动锚定：点「Load earlier」时记下 `scrollHeight - scrollTop`，合并后在效果里恢复该偏移，让读者正在看的内容不跳；否则新消息仍照旧滚到底部。
+
+### 验收
+
+`test/lan-earlier.test.js` 用分页 mock 团队覆盖：按 `seq` 翻页、按稳定 id 翻页、翻到最后一页 `cursor: null`；以及节点经 Hub 端到端前插两页直到 `items` 补齐 10 条且无重复、游标到头后返回空。界面层 `test/hub-chat.test.js` 新增：`prependEarlier` 按 id 去重前插、有游标时显示「Load earlier」按钮、点击后调用一次 `hubEarlier` 并把返回页前插。
+
+### 已知限制
+
+滚动锚定是单元测试下的 best-effort 实现（`anchorRef` 在 `useEffect` 里恢复偏移）；真实浏览器的「前插不跳动」仍按上面的双机清单人工验证。跨 part 的分页依赖 `chatPage` 的 `{part, beforeSeq}` 游标，节点需要把副本里的游标原样回传；Hub 重启换了 part 布局时，旧游标可能指到不存在的 part，`chatPage` 会返回空，节点据此收起按钮，下一次快照重新给游标。

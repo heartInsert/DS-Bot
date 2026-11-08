@@ -25905,11 +25905,31 @@ function hubRows(items, pending) {
 }
 function applyHubReply(view, reply) {
   const cursor = typeof reply?.epoch === "string" ? { epoch: reply.epoch, revision: reply.revision } : null;
+  const earlier = reply?.earlier ?? null;
   const offline = reply?.offline === true;
   if (reply?.unchanged === true) {
-    return { view: { ...view ?? { items: [] }, offline }, cursor };
+    return { view: { ...view ?? { items: [] }, offline, earlier: view?.earlier ?? earlier }, cursor };
   }
-  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [] }, cursor };
+  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [], earlier }, cursor };
+}
+function prependEarlier(items, earlierItems) {
+  const current = Array.isArray(items) ? items : [];
+  const incoming = Array.isArray(earlierItems) ? earlierItems : [];
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const item of incoming) {
+    if (item?.id === void 0 || !seen.has(item.id)) {
+      out.push(item);
+      if (item?.id !== void 0) seen.add(item.id);
+    }
+  }
+  for (const item of current) {
+    if (item?.id === void 0 || !seen.has(item.id)) {
+      out.push(item);
+      if (item?.id !== void 0) seen.add(item.id);
+    }
+  }
+  return out;
 }
 function Text({ text }) {
   return (0, import_react60.createElement)(import_dsh_client_ui_primitives.MarkdownText, { text: String(text ?? ""), variant: "compact", labels: mdLabels4() });
@@ -25945,17 +25965,30 @@ function Row4({ item }) {
       (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react60.createElement)(Text, { text: item.text }))
     );
   }
+  if (kind === "answer") {
+    return (0, import_react60.createElement)(AnsweredCell, { node: { data: item } });
+  }
+  if (kind === "closed") {
+    if (item.question !== void 0) {
+      return (0, import_react60.createElement)("div", { className: "bt-hub-card" }, (0, import_react60.createElement)(SettledQuestion, { question: item.question, closed: item.closed }));
+    }
+    if (item.view !== void 0) {
+      return (0, import_react60.createElement)("div", { className: "bt-hub-card" }, (0, import_react60.createElement)(SettledQuestion, { question: { question: item.title || t("View") }, closed: item.closed }));
+    }
+  }
   return null;
 }
 function HubChat({ id, kind, name, left, actions }) {
   const [view, setView] = (0, import_react60.useState)(null);
   const [text, setText] = (0, import_react60.useState)("");
   const [sending, setSending] = (0, import_react60.useState)(false);
+  const [loadingEarlier, setLoadingEarlier] = (0, import_react60.useState)(false);
   const [error, setError] = (0, import_react60.useState)(null);
   const [pending, setPending] = (0, import_react60.useState)(null);
   const cursorRef = (0, import_react60.useRef)(null);
   const viewRef = (0, import_react60.useRef)(null);
   const listRef = (0, import_react60.useRef)(null);
+  const anchorRef = (0, import_react60.useRef)(null);
   const refresh = (0, import_react60.useCallback)(() => {
     const cursor = cursorRef.current;
     void Promise.resolve(actions.hubChat(id, kind, cursor)).then((reply) => {
@@ -25977,8 +26010,31 @@ function HubChat({ id, kind, name, left, actions }) {
   (0, import_react60.useEffect)(() => {
     const list = listRef.current;
     if (list === null) return;
-    list.scrollTop = list.scrollHeight;
+    if (anchorRef.current !== null) {
+      list.scrollTop = list.scrollHeight - anchorRef.current;
+      anchorRef.current = null;
+    } else {
+      list.scrollTop = list.scrollHeight;
+    }
   }, [view?.items?.length, pending]);
+  const loadEarlier = () => {
+    if (loadingEarlier) return;
+    setLoadingEarlier(true);
+    setError(null);
+    const list = listRef.current;
+    if (list !== null) anchorRef.current = list.scrollHeight - list.scrollTop;
+    void Promise.resolve(actions.hubEarlier(id, kind)).then((reply) => {
+      const earlierItems = Array.isArray(reply?.items) ? reply.items : [];
+      const merged = prependEarlier(viewRef.current?.items, earlierItems);
+      const next = { ...viewRef.current ?? { items: [] }, items: merged, earlier: reply?.cursor ?? null };
+      viewRef.current = next;
+      setView(next);
+      setLoadingEarlier(false);
+    }, (reason) => {
+      setLoadingEarlier(false);
+      setError(reason?.message ?? String(reason));
+    });
+  };
   const send = () => {
     const value = text.trim();
     if (value === "" || sending) return;
@@ -26017,6 +26073,11 @@ function HubChat({ id, kind, name, left, actions }) {
     (0, import_react60.createElement)(
       "div",
       { className: "bt-hub-body", ref: listRef },
+      view?.earlier ? (0, import_react60.createElement)(
+        "div",
+        { className: "bt-hub-earlier" },
+        (0, import_react60.createElement)("button", { type: "button", className: "bt-hub-earlier-btn", disabled: loadingEarlier, onClick: loadEarlier }, loadingEarlier ? "…" : t("Load earlier"))
+      ) : null,
       error === null ? null : (0, import_react60.createElement)("div", { className: "bt-hub-error" }, error),
       offline && items.length === 0 ? (0, import_react60.createElement)("div", { className: "bt-hub-empty" }, t("This computer is not connected to the hub.")) : null,
       items.map((item, index) => (0, import_react60.createElement)(Row4, { key: itemKey(item, index), item }))
@@ -26061,6 +26122,11 @@ var HUB_CHAT_CSS = `
 .bt-hub-bot .bt-hub-bubble{background:var(--bt-card);border:.5px solid var(--bt-line)}
 .bt-hub-divider{align-self:center;font-size:11px;color:var(--bt-ink-3)}
 .bt-hub-event{align-self:center;font-size:12px;color:var(--bt-ink-2)}
+.bt-hub-card{flex:none;width:100%}
+.bt-hub-earlier{align-self:center;flex:none}
+.bt-hub-earlier-btn{padding:6px 14px;border-radius:999px;border:0;background:var(--bt-hover);color:var(--bt-ink-2);font:inherit;font-size:12px;cursor:pointer}
+.bt-hub-earlier-btn:hover{background:var(--bt-active);color:var(--bt-ink)}
+.bt-hub-earlier-btn:disabled{opacity:.5;cursor:default}
 .bt-hub-empty{align-self:center;margin:auto;font-size:13px;color:var(--bt-ink-2)}
 .bt-hub-error{align-self:center;font-size:13px;color:var(--bt-danger)}
 .bt-hub-composer{display:flex;align-items:flex-end;gap:8px;padding:12px 16px;border-top:.5px solid var(--bt-line)}
@@ -28322,6 +28388,7 @@ function apply(ctx) {
     // answer "unchanged" without the item list when nothing has moved.
     hubChat: (id, kind, cursor) => call("hub-chat", { ...kind === "room" ? { roomId: id } : { botId: id }, ...cursor?.epoch !== void 0 ? { epoch: cursor.epoch, since: cursor.revision } : {} }),
     hubSend: (id, kind, text, messageId) => call("hub-send", { ...kind === "room" ? { roomId: id } : { botId: id }, text, messageId }),
+    hubEarlier: (id, kind) => call("hub-earlier", { ...kind === "room" ? { roomId: id } : { botId: id } }),
     openHubChat: (id, kind, name) => ui2.set((state) => ({ ...state, hubChat: { id, kind, name }, details: null, view: "details", renaming: false, tab: null, newChat: null, exchange: null, menu: null, palette: null })),
     closeHubChat: () => ui2.set((state) => state.hubChat === null ? state : { ...state, hubChat: null }),
     openSession: (id) => {
