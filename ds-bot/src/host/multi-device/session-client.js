@@ -257,13 +257,13 @@ export function createSessionClient({
     return out
   }
 
-  async function pullOnce() {
+  async function pullOnce({ waitMs: forcedWait } = {}) {
     const key = await resolveActive()
     const conv = convOf(key)
     const query = new URLSearchParams()
     if (conv.roomId !== undefined) query.set('room', conv.roomId)
     else query.set('bot', conv.botId ?? '')
-    query.set('wait', String(Math.max(0, waitMs)))
+    query.set('wait', String(Math.max(0, Number.isInteger(forcedWait) ? forcedWait : waitMs)))
     if (conv.replica !== undefined) {
       query.set('since', String(conv.replica.revision))
       if (typeof conv.replica.epoch === 'string') query.set('epoch', conv.replica.epoch)
@@ -363,9 +363,10 @@ export function createSessionClient({
       return team ?? { bots: [], rooms: [] }
     },
     pull: pullOnce,
-    // Follow a conversation: the next pull and every pull after reads this one. The
-    // replica on disk is returned immediately when it already exists; a conversation
-    // never opened here is pulled now, whether or not the background loop is running.
+    // Follow a conversation: the next pull and every pull after reads this one. A switch
+    // (a different conversation than the one the loop holds) pulls it now, so the view
+    // sees fresh data instead of waiting for the loop's long poll to time out; the
+    // replica on disk is returned immediately when the conversation was already open.
     async open(reference) {
       if (team === undefined) await refreshTeam()
       const found = resolve(reference)
@@ -373,9 +374,11 @@ export function createSessionClient({
       const conv = convOf(key)
       if (found.kind === 'bot') { conv.botId = found.id; conv.botName = found.name }
       else { conv.roomId = found.id; conv.roomName = found.name }
+      const switched = active !== key
       active = key
       activeName = found.name
-      if (conv.replica === undefined) await pullOnce().catch(() => {})
+      if (switched) await pullOnce({ waitMs: 0 }).catch(() => {})
+      else if (conv.replica === undefined) await pullOnce().catch(() => {})
       return conv.replica
     },
     // A message typed on this machine goes to the hub, which writes it into the one

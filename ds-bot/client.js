@@ -28248,6 +28248,10 @@ function apply(ctx) {
   const homeToMainBot = () => {
     const snapshot = roster.getSnapshot();
     if (!snapshot.ready || !snapshot.mainBotId) return;
+    if (actions.isHubNode()) {
+      actions.openSession(snapshot.mainBotId);
+      return;
+    }
     const main = mainView();
     if (main !== void 0 && snapshot.byId[main] === void 0 && snapshot.roomsById[main] === void 0) {
       actions.openSession(snapshot.mainBotId);

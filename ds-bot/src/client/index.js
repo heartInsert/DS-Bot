@@ -470,6 +470,12 @@ export function apply(ctx) {
   const homeToMainBot = () => {
     const snapshot = roster.getSnapshot()
     if (!snapshot.ready || !snapshot.mainBotId) return
+    // A joined node has no local Session for the hub's conversation, so the empty
+    // workspace picker would otherwise stay: open the hub's Main Bot instead.
+    if (actions.isHubNode()) {
+      actions.openSession(snapshot.mainBotId)
+      return
+    }
     const main = mainView()
     if (main !== undefined && snapshot.byId[main] === undefined && snapshot.roomsById[main] === undefined) {
       actions.openSession(snapshot.mainBotId)
