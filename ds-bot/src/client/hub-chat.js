@@ -10,7 +10,7 @@
 // has moved, so the poll stays cheap.
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { MarkdownText } from './dsh-primitives.js'
-import { CloseIcon } from './icons.js'
+import { ArrowUpIcon, CloseIcon } from './icons.js'
 import { SettledQuestion, PendingQuestion } from './questions.js'
 import { AnsweredReply, WidgetCell, PendingView } from './widget-cell.js'
 import { ApprovalCard } from './approval-queue.js'
@@ -105,6 +105,25 @@ function relayLabel(reply) {
   }
 }
 
+// One Bot message inside the conversation: the same bubble classes the main conversation
+// draws (`bt-bubble`), so a node's chat is indistinguishable from the hub's. A group post
+// keeps its name row (`bt-group-name`); a Bot reply in its own chat has none.
+function BotMessage({ texts, name }) {
+  return h('div', { className: 'bt-group-msg' },
+    name === undefined || name === null ? null : h('span', { className: 'bt-group-name' }, name),
+    h('div', { className: 'bt-astack' },
+      texts.map((text, index) => h('div', { className: 'bt-msg', key: index },
+        h('div', { className: 'bt-msg-line' },
+          h('div', { className: 'bt-bubble' }, h(Text, { text })))))))
+}
+
+// The user's own message: the same `bt-umsg`/`bt-ubody` classes and tokens main uses.
+function UserMessage({ item }) {
+  return h('div', { className: 'bt-umsg', 'data-pending': item.pending === true || undefined },
+    h('div', { className: 'bt-ustack' },
+      h('div', { className: 'bt-ubody' }, String(item.text ?? ''))))
+}
+
 // A conversation item the hub served: a user message, a Bot reply, a group post, an
 // event line or a divider. Settled question, view and answer cards reuse the same
 // components the main conversation draws for history; the live cards (approvals,
@@ -112,32 +131,30 @@ function relayLabel(reply) {
 function Row({ item }) {
   const kind = item?.kind
   if (kind === 'divider') {
-    return h('div', { className: 'bt-hub-divider' }, item.time ? new Date(item.time).toLocaleTimeString() : '')
+    return h('div', { className: 'bt-time-sep' }, item.time ? new Date(item.time).toLocaleTimeString() : '')
   }
   if (kind === 'event') {
     const name = item.name ?? 'Bot'
-    if (item.role === 'report') return h('div', { className: 'bt-hub-event' }, `${t('Replies from')} ${t('a group chat')}`)
+    if (item.role === 'report') return h('div', { className: 'bt-event' }, h('span', null, `${t('Replies from')} ${t('a group chat')}`))
     const prefix = { stopped: t('Stopped by'), reply: t('Reply from') }[item.role] ?? t('Message from')
-    return h('div', { className: 'bt-hub-event' }, `${prefix} ${name}`)
+    return h('div', { className: 'bt-event' }, h('span', null, `${prefix} ${name}`))
   }
   if (kind === 'post') {
     const texts = Array.isArray(item.texts) && item.texts.length > 0 ? item.texts : [item.text]
-    return h('div', { className: 'bt-hub-row bt-hub-bot' },
-      h('div', { className: 'bt-hub-who' }, item.name ?? 'Bot'),
-      h('div', { className: 'bt-hub-bubble' }, texts.map((text, index) => h(Text, { key: index, text }))))
+    return h(BotMessage, { texts, name: item.name ?? null })
   }
   if (kind === 'bot') {
-    return h('div', { className: 'bt-hub-row bt-hub-bot' },
-      h('div', { className: 'bt-hub-bubble' }, h(Text, { text: item.text })))
+    return h('div', { className: 'bt-msg' },
+      h('div', { className: 'bt-msg-line' },
+        h('div', { className: 'bt-bubble' }, h(Text, { text: item.text }))))
   }
   if (kind === 'user') {
-    return h('div', { className: 'bt-hub-row bt-hub-user', 'data-pending': item.pending === true || undefined },
-      h('div', { className: 'bt-hub-bubble' }, h(Text, { text: item.text })))
+    return h(UserMessage, { item })
   }
   // A group round's event line, drawn like the main group conversation reads it.
   if (kind === 'relay') {
     const label = relayLabel(item.reply)
-    return label === null ? null : h('div', { className: 'bt-hub-event' }, label)
+    return label === null ? null : h('div', { className: 'bt-event' }, h('span', null, label))
   }
   // A question, view or handoff answered by a message: the settled card, read-only.
   if (kind === 'answer') {
@@ -150,10 +167,10 @@ function Row({ item }) {
   // A question or view card closed without an answer on it: the settled card, read-only.
   if (kind === 'closed') {
     if (item.question !== undefined) {
-      return h('div', { className: 'bt-hub-card' }, h(SettledQuestion, { question: item.question, closed: item.closed }))
+      return h(SettledQuestion, { question: item.question, closed: item.closed })
     }
     if (item.view !== undefined) {
-      return h('div', { className: 'bt-hub-card' }, h(SettledQuestion, { question: { question: item.title || t('View') }, closed: item.closed }))
+      return h(SettledQuestion, { question: { question: item.title || t('View') }, closed: item.closed })
     }
   }
   return null
@@ -326,7 +343,7 @@ export function HubChat({ id, kind, name, left, actions }) {
           }
         },
       }),
-      h('button', { type: 'button', className: 'bt-hub-send', disabled: offline || sending || text.trim() === '', onClick: send }, sending ? '…' : t('Send'))))
+      h('button', { type: 'button', className: 'bt-hub-send', 'aria-label': t('Send'), disabled: offline || sending || text.trim() === '', onClick: send }, sending ? '…' : h(ArrowUpIcon))))
 }
 
 export const HUB_CHAT_CSS = `
@@ -339,16 +356,8 @@ export const HUB_CHAT_CSS = `
 .bt-hub-close{flex:none;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);cursor:pointer}
 .bt-hub-close:hover{background:var(--bt-hover)}
 .bt-hub-body{flex:1;min-height:0;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
-.bt-hub-row{display:flex;flex-direction:column;gap:3px;max-width:72%}
-.bt-hub-user{align-self:flex-end;align-items:flex-end}
-.bt-hub-bot{align-self:flex-start;align-items:flex-start}
-.bt-hub-who{font-size:11px;color:var(--bt-ink-2);padding:0 2px}
-.bt-hub-bubble{padding:8px 12px;border-radius:12px;font-size:14px;line-height:20px;white-space:pre-wrap;overflow-wrap:anywhere}
-.bt-hub-user .bt-hub-bubble{background:var(--bt-accent);color:var(--bt-main)}
-.bt-hub-bot .bt-hub-bubble{background:var(--bt-card);border:.5px solid var(--bt-line)}
-.bt-hub-divider{align-self:center;font-size:11px;color:var(--bt-ink-3)}
-.bt-hub-event{align-self:center;font-size:12px;color:var(--bt-ink-2)}
-.bt-hub-card{flex:none;width:100%}
+/* The hub replica has no avatar rail, so the group name sits flush against the bubble. */
+.bt-hub .bt-group-name{margin-left:0}
 .bt-hub-cards{display:flex;flex-direction:column;gap:8px;flex:none}
 .bt-hub-earlier{align-self:center;flex:none}
 .bt-hub-earlier-btn{padding:6px 14px;border-radius:999px;border:0;background:var(--bt-hover);color:var(--bt-ink-2);font:inherit;font-size:12px;cursor:pointer}
@@ -356,8 +365,14 @@ export const HUB_CHAT_CSS = `
 .bt-hub-earlier-btn:disabled{opacity:.5;cursor:default}
 .bt-hub-empty{align-self:center;margin:auto;font-size:13px;color:var(--bt-ink-2)}
 .bt-hub-error{align-self:center;font-size:13px;color:var(--bt-danger)}
-.bt-hub-composer{display:flex;align-items:flex-end;gap:8px;padding:12px 16px;border-top:.5px solid var(--bt-line)}
-.bt-hub-input{flex:1;min-width:0;resize:none;padding:9px 12px;border-radius:12px;border:.5px solid var(--bt-line);background:var(--bt-card);color:var(--bt-ink);font:inherit;font-size:14px;line-height:20px;max-height:120px}
-.bt-hub-send{flex:none;padding:9px 16px;border-radius:12px;border:0;background:var(--bt-accent);color:var(--bt-main);font:inherit;font-size:14px;font-weight:600;cursor:pointer}
+/* The composer mirrors DSH's own [data-composer-card]: the same glass pill, input and
+   circular accent send button, drawn only with the theme tokens the shell defines. */
+.bt-hub-composer{flex:none;display:flex;align-items:center;gap:0;min-height:44px;margin:0 16px 13px;padding:7.5px;box-sizing:border-box;border-radius:22px;background:var(--bt-glass-bg);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);border:.5px solid var(--bt-glass-rim);box-shadow:var(--bt-glass-shadow);transition:border-color .15s ease}
+.bt-hub-composer:hover,.bt-hub-composer:focus-within{border-color:color-mix(in srgb,var(--bt-ink) 30%,transparent)}
+.bt-hub-input{flex:1;min-width:0;border:0;background:transparent;color:var(--bt-ink);font:inherit;font-size:14px;line-height:24px;padding:2px 8px;resize:none;max-height:120px;outline:none}
+.bt-hub-input::placeholder{color:color-mix(in srgb,var(--bt-ink) 36%,transparent)}
+.bt-hub-send{flex:none;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:var(--bt-accent);color:var(--bt-accent-ink);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:opacity .15s ease}
+.bt-hub-send:hover:not(:disabled){opacity:.9}
 .bt-hub-send:disabled{opacity:.5;cursor:default}
+.bt-hub-send svg{width:14px;height:14px}
 `

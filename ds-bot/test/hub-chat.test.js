@@ -284,7 +284,7 @@ test('Load earlier prepends the returned page and calls the action once', async 
   await flush()
   tree = renderHubChat({ actions })
   assert.equal(called.length, 1)
-  const rows = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-hub-user'))
+  const rows = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-umsg'))
   assert.equal(rows.length, 2, 'the earlier message is prepended before the tail')
 })
 
@@ -313,7 +313,7 @@ test('group round events render as event lines', async () => {
   flushEffects()
   await flush()
   tree = renderHubChat({ actions })
-  const events = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').includes('bt-hub-event'))
+  const events = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').includes('bt-event'))
   assert.equal(events.length, 2, 'each relay row renders one event line')
 })
 
