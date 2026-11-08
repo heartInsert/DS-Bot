@@ -1643,6 +1643,12 @@ const HOST_ZH = {
   "This computer's Bots, memory and settings are replaced by the hub's. They are backed up first.": '这台电脑的 Bot、记忆和设置会被中心的覆盖；覆盖前先备份。',
   'Replace and join': '备份并加入',
   Backup: '备份',
+  // LAN multi-device: the hub conversation a joined node renders in its own chat view
+  'Hub conversation': '中心会话',
+  Hub: '中心',
+  'Offline — messages are not sent': '离线 — 消息不会发送',
+  'This computer is not connected to the hub.': '这台电脑没有连上中心。',
+  Message: '发消息',
 }
 Object.assign(ZH, HOST_ZH)
 

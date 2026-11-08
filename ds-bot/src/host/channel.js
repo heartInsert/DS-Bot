@@ -137,7 +137,7 @@ export function install(rt) {
   }
   // What a host that only reads the team may still answer.
   // Updates change the dsh profile, not the team, so a reading host may run them too.
-  const READS = new Set(['state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'multi-device-status'])
+  const READS = new Set(['state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'multi-device-status', 'hub-chat'])
 
   async function setPrefs(body) {
     if (body.theme !== undefined) {
@@ -667,6 +667,12 @@ export function install(rt) {
           return ok(await rt.multiDeviceApproveJoin(String(body.request ?? '')))
         case 'multi-device-deny':
           return ok(await rt.multiDeviceDenyJoin(String(body.request ?? '')))
+        // The hub conversation a joined node's chat view renders and sends to: the
+        // browser's own route reaches the hub through the node's worker (the one writer).
+        case 'hub-chat':
+          return ok(await rt.multiDeviceHubConversation(body))
+        case 'hub-send':
+          return ok(await rt.multiDeviceHubSend(body))
         case 'diagnostics':
           await rt.load()
           return ok(await rt.diagnostics.report(body))

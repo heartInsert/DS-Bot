@@ -56,6 +56,7 @@ import { USER_MESSAGE_CSS, UserMessageCell, canDrawUserMessages } from './user-m
 import { QueueDock, QUEUE_CSS } from './queue-dock.js'
 import { noticeApprovals } from './approval-notices.js'
 import { listedOpener } from './open-listed.js'
+import { HUB_CHAT_CSS } from './hub-chat.js'
 
 export const inject = ['sessions', 'uiWorkspace', 'uiConversation', 'slots', 'theme', 'layout']
 
@@ -75,7 +76,7 @@ export function apply(ctx) {
   let seenAt = seenStore.read()
   // `details` is the panel's subject (a Session id); `view` picks details or the
   // subject Bot's browser inside it.
-  const ui = createSource({ details: null, view: 'details', renaming: false, tab: null, side: null, newChat: null, exchange: null, menu: null, voice: null, palette: null, quote: null, settings: null, memory: null, toast: null, signIn: null, renameAgent: null, unread: unreadStore.read(), reactions: reactionStore.read(), visits: {}, panelYield: false, leftDrawer: false, bootFailed: false, goalCompose: null, goalOpen: null })
+  const ui = createSource({ details: null, view: 'details', renaming: false, tab: null, side: null, newChat: null, exchange: null, menu: null, voice: null, palette: null, quote: null, settings: null, memory: null, toast: null, signIn: null, renameAgent: null, unread: unreadStore.read(), reactions: reactionStore.read(), visits: {}, panelYield: false, leftDrawer: false, bootFailed: false, goalCompose: null, goalOpen: null, hubChat: null })
   // The left column's kept preference, and the frame geometry the layout rules
   // in frame-layout.js read: the window and the shell's collapsed track come from
   // installFrameWatch, the open column's width is the user's own.
@@ -490,9 +491,29 @@ export function apply(ctx) {
     // The full-pane overlays sit above the conversation, so opening one must dismiss them
     // or the click appears to do nothing.
     isAgentSession: id => isAgentSessionId(id),
+    // Whether this computer is a joined node, so its chat view reads the hub instead of
+    // its own empty Sessions.
+    isHubNode: () => roster.getSnapshot().multiDevice?.node?.paired === true,
+    hubChat: (id, kind) => call('hub-chat', kind === 'room' ? { roomId: id } : { botId: id }),
+    hubSend: (id, kind, text, messageId) => call('hub-send', { ...(kind === 'room' ? { roomId: id } : { botId: id }), text, messageId }),
+    openHubChat: (id, kind, name) => ui.set(state => ({ ...state, hubChat: { id, kind, name }, newChat: null, exchange: null, menu: null, palette: null })),
+    closeHubChat: () => ui.set(state => (state.hubChat === null ? state : { ...state, hubChat: null })),
     openSession: (id) => {
       // A DSH Agent Session id lands on the plain surface, not the Bot skin.
       if (isAgentSessionId(id)) return actions.openAgentSession(id)
+      // A joined node renders the hub's conversation for a Bot or a group chat instead
+      // of opening the empty local Session the hub's id names here.
+      if (actions.isHubNode()) {
+        const snapshot = roster.getSnapshot()
+        const room = snapshot.roomsById[id]
+        const bot = snapshot.byId[id]
+        if (room !== undefined || bot !== undefined) {
+          const kind = room !== undefined ? 'room' : 'bot'
+          const name = room?.name ?? bot?.name
+          actions.openHubChat(id, kind, name)
+          return
+        }
+      }
       ui.set(state => (state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state))
       setPlain(false)
       const target = partFor(id)
@@ -837,6 +858,19 @@ export function apply(ctx) {
     })
   }
   const face = () => ({ actions, hooks: { roster, ui, activity, work, approvals, memoryNews, registry, turnClock, live, computer, cards, heldCards, browserPages, browserTabs, browserHolds, surface, update, frame, sidebarPref } })
+  // Leaving the hub (or the hub's team no longer naming this computer a node) closes the
+  // hub conversation, so the node goes back to its own local behaviour.
+  ctx.effect(() => {
+    let joined = roster.getSnapshot().multiDevice?.node?.paired === true
+    const sync = () => {
+      const next = roster.getSnapshot().multiDevice?.node?.paired === true
+      if (joined && !next) ui.set(state => (state.hubChat === null ? state : { ...state, hubChat: null }))
+      joined = next
+    }
+    const off = roster.subscribe(sync)
+    return () => off()
+  }, 'ds-bot: close hub chat on leave')
+
   // The queue dock's per-session verbs, supplied the way the shell's own dock
   // injects them (the session facade and the conversation service).
   const queueFace = (sessionId) => ({
@@ -1099,6 +1133,7 @@ export function apply(ctx) {
   ]
   const installConversation = () => [
     () => installCompiledStyles(CONVERSATION_CSS, 'conversation'),
+    () => installCompiledStyles(HUB_CHAT_CSS, 'hub-chat'),
     () => installCompiledStyles(TURN_ERROR_CSS, 'turn-errors'),
     () => installCompiledStyles(QUEUE_CSS, 'queue'),
     () => installMentions(),

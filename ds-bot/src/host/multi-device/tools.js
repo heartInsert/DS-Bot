@@ -810,6 +810,49 @@ export function install(rt) {
     return status()
   }
 
+  // The hub conversation a joined node's chat view reads and writes. The node's worker
+  // holds the session client; these are thin wrappers so the /api/bot channel (the
+  // browser's own route) can reach the hub through the one writer.
+  const hubReference = ({ botId, roomId } = {}) => (roomId !== undefined && roomId !== ''
+    ? `room:${roomId}`
+    : `bot:${botId ?? ''}`)
+
+  const hubConversation = async (body = {}) => {
+    const session = nodeWorker?.session?.()
+    const reference = hubReference(body)
+    if (session === undefined) return { offline: true, reference, items: [], error: 'This computer is not joined to a hub.' }
+    try {
+      const replica = await session.open(reference)
+      const info = session.info()
+      return {
+        reference,
+        offline: info.status === 'offline' || info.status === 'unauthorized',
+        status: info.status,
+        ...(replica === undefined ? {} : {
+          botName: replica.botName,
+          roomName: replica.roomName,
+          epoch: replica.epoch,
+          revision: replica.revision,
+          items: Array.isArray(replica.items) ? replica.items : [],
+        }),
+      }
+    } catch (error) {
+      return { offline: true, reference, items: [], error: error.message }
+    }
+  }
+
+  const hubSend = async (body = {}) => {
+    const session = nodeWorker?.session?.()
+    if (session === undefined) throw new Error('This computer is not joined to a hub.')
+    try {
+      await session.open(hubReference(body))
+      return await session.send(String(body?.text ?? ''), { messageId: typeof body?.messageId === 'string' && body.messageId !== '' ? body.messageId : undefined })
+    } catch (error) {
+      if (error?.code === 'hub/offline' || error?.fatal === true) throw error
+      throw new Error(`The hub is not reachable; the message was not sent. ${error?.message ?? ''}`.trim())
+    }
+  }
+
   Object.defineProperty(rt, 'multiDeviceEnabled', { get: () => enabled, configurable: true })
   Object.defineProperty(rt, 'multiDeviceError', { get: () => failure, configurable: true })
   Object.assign(rt, {
@@ -827,6 +870,9 @@ export function install(rt) {
     // the page uses the status above.
     multiDeviceNodeWorker: () => nodeWorker,
     multiDeviceRefreshTeam: refreshTeam,
+    // The hub conversation for the node's chat view: read a replica or send a message.
+    multiDeviceHubConversation: hubConversation,
+    multiDeviceHubSend: hubSend,
   })
 
   // The saved choice is read once the team file is loaded; the profile only supplies
