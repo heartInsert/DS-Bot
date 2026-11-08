@@ -387,6 +387,40 @@ export function deviceTools({ hub, ready = Promise.resolve({ ok: true }), shared
   return tools
 }
 
+// The node-side answer for a hub-chat read, built from a conversation's replica and the
+// session client's status. When the caller's cursor already names this replica the answer
+// is `unchanged` and carries no item list, so a browser's poll stays cheap; the offline
+// flag is always present so a stopped hub still shows within a poll.
+export function hubChatAnswer({ replica, status, reference, cursor } = {}) {
+  const offline = status === 'offline' || status === 'unauthorized'
+  const base = { reference, offline, status, epoch: replica?.epoch, revision: replica?.revision }
+  const upToDate = cursor !== undefined && replica !== undefined
+    && replica.epoch === cursor.epoch && replica.revision === cursor.revision
+  if (upToDate) return { ...base, unchanged: true }
+  return {
+    ...base,
+    ...(replica === undefined ? {} : {
+      botName: replica.botName,
+      roomName: replica.roomName,
+      items: Array.isArray(replica.items) ? replica.items : [],
+    }),
+  }
+}
+
+// A joined node's hub-chat read: the replica of one conversation, or "unchanged" when the
+// cursor the client sent already names it.
+export async function readHubChat(session, reference, cursor) {
+  const replica = await session.open(reference)
+  return hubChatAnswer({ replica, status: session.info().status, reference, cursor })
+}
+
+// A joined node's hub-send write: a user message with an idempotency key the hub applies
+// to the one Session. The key is forwarded unchanged so a retry writes once.
+export async function sendHubChat(session, reference, text, messageId) {
+  await session.open(reference)
+  return session.send(text, { messageId })
+}
+
 export function install(rt) {
   const { ctx } = rt
   const options = multiDeviceOptions(rt.config)
@@ -821,21 +855,11 @@ export function install(rt) {
     const session = nodeWorker?.session?.()
     const reference = hubReference(body)
     if (session === undefined) return { offline: true, reference, items: [], error: 'This computer is not joined to a hub.' }
+    const cursor = typeof body?.epoch === 'string' && Number.isInteger(body.since)
+      ? { epoch: body.epoch, revision: body.since }
+      : undefined
     try {
-      const replica = await session.open(reference)
-      const info = session.info()
-      return {
-        reference,
-        offline: info.status === 'offline' || info.status === 'unauthorized',
-        status: info.status,
-        ...(replica === undefined ? {} : {
-          botName: replica.botName,
-          roomName: replica.roomName,
-          epoch: replica.epoch,
-          revision: replica.revision,
-          items: Array.isArray(replica.items) ? replica.items : [],
-        }),
-      }
+      return await readHubChat(session, reference, cursor)
     } catch (error) {
       return { offline: true, reference, items: [], error: error.message }
     }
@@ -845,8 +869,7 @@ export function install(rt) {
     const session = nodeWorker?.session?.()
     if (session === undefined) throw new Error('This computer is not joined to a hub.')
     try {
-      await session.open(hubReference(body))
-      return await session.send(String(body?.text ?? ''), { messageId: typeof body?.messageId === 'string' && body.messageId !== '' ? body.messageId : undefined })
+      return await sendHubChat(session, hubReference(body), String(body?.text ?? ''), typeof body?.messageId === 'string' && body.messageId !== '' ? body.messageId : undefined)
     } catch (error) {
       if (error?.code === 'hub/offline' || error?.fatal === true) throw error
       throw new Error(`The hub is not reachable; the message was not sent. ${error?.message ?? ''}`.trim())
