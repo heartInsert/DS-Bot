@@ -288,6 +288,40 @@ test('the same machine asking twice is one row, whatever case its hostname has',
   assert.equal(hub.joinRequests().length, 1)
 })
 
+test('a request that expired while the hub was down is not restored', async t => {
+  let at = Date.UTC(2026, 10, 8, 10, 0, 0)
+  const dataDir = folder('stale-data')
+  const first = createHub({ dataDir, host: '127.0.0.1', port: 0, discovery: false, now: () => at, log: () => {} })
+  await first.start()
+  t.after(() => first.stop())
+  const asked = await fetch(`${first.url}/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ device: { name: 'mac-mini', hostname: 'Mac.lan' } }),
+  }).then(response => response.json())
+  assert.equal(asked.status, 'pending')
+  await first.stop()
+
+  // The file still holds the request; the hub that loads it after its window has passed
+  // must not put a machine nobody can allow back on the page.
+  at += 5 * 60_000 + 1
+  const second = createHub({ dataDir, host: '127.0.0.1', port: 0, discovery: false, now: () => at, log: () => {} })
+  await second.start()
+  t.after(() => second.stop())
+  assert.deepEqual(second.joinRequests(), [])
+  assert.equal(second.approveJoin(asked.requestId), false)
+  assert.equal(second.nodes().length, 0)
+
+  // The machine can simply ask again and gets a fresh row.
+  const again = await fetch(`${second.url}/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ device: { name: 'mac-mini', hostname: 'Mac.lan' } }),
+  }).then(response => response.json())
+  assert.notEqual(again.requestId, asked.requestId)
+  assert.equal(second.joinRequests().filter(entry => entry.status === 'pending').length, 1)
+})
+
 test('a request that waited too long cannot be allowed and leaves the page', async t => {
   let at = Date.UTC(2026, 10, 8, 10, 0, 0)
   const hub = createHub({ dataDir: folder('expiry-data'), host: '127.0.0.1', port: 0, discovery: false, now: () => at, log: () => {} })
