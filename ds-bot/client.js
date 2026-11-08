@@ -2044,6 +2044,8 @@ function countCards(state, sessionId, callIds, delta) {
 }
 
 // src/client/team-actions.js
+var opSeq = 0;
+var newOpId = () => `op-${opSeq += 1}-${Math.random().toString(36).slice(2, 8)}`;
 function teamActions({ call: call2, after, partFor, roster, ui: ui2, live, cards, heldCards, turnClock, panelFolded, approvals }) {
   const memoryOf = (id) => roster.getSnapshot().roomsById[id] ? { roomId: id } : { botId: id };
   const yieldTo = (state, view) => state.panelYield === true || panelFolded?.(view) === true;
@@ -2150,7 +2152,7 @@ function teamActions({ call: call2, after, partFor, roster, ui: ui2, live, cards
     closeOverlay: () => {
       ui2.set((state) => ({ ...state, newChat: null, exchange: null, details: state.newChat || state.exchange ? state.details : null }));
     },
-    createBot: (payload) => after(call2("create-bot", payload)),
+    createBot: (payload, opId) => after(call2("create-bot", { ...payload, ...opId ? { opId } : {} })),
     // The avatar library: photos the user imported once, kept by the host.
     avatarLibrary: (options = {}) => call2("avatar-library", options),
     importAvatars: (items) => call2("avatar-import", { items }),
@@ -18090,6 +18092,7 @@ function CreateBot({ roster, actions, start, brief = "", onBack, canGoBack, onCr
   const [error, setError] = (0, import_react40.useState)("");
   const fileRef = (0, import_react40.useRef)(null);
   const frame = (0, import_react40.useRef)(null);
+  const opId = (0, import_react40.useRef)(newOpId());
   useEscape(onBack);
   (0, import_react40.useEffect)(() => {
     if (inline) frame.current?.scrollIntoView({ block: "start", behavior: "smooth" });
@@ -18103,7 +18106,7 @@ function CreateBot({ roster, actions, start, brief = "", onBack, canGoBack, onCr
     setError("");
     setBusy(true);
     try {
-      const bot = await actions.createBot(createPayload({ name: finalName, look, image, model, effort, brief }));
+      const bot = await actions.createBot(createPayload({ name: finalName, look, image, model, effort, brief }), opId.current);
       onCreated(bot);
     } catch (failure) {
       setError(failure?.message ?? String(failure));
@@ -18235,6 +18238,7 @@ function NewChat({ mode, roster, actions }) {
   const [cursor, setCursor] = (0, import_react41.useState)(0);
   const [draft, setDraft] = (0, import_react41.useState)(mode === "create" ? { name: "", fromList: false } : null);
   const inputRef = (0, import_react41.useRef)(null);
+  const groupOpId = (0, import_react41.useRef)(newOpId());
   const close = () => actions.closeOverlay();
   useEscape(close);
   const paneLeft = usePaneLeft();
@@ -18294,7 +18298,7 @@ function NewChat({ mode, roster, actions }) {
   const makeGroup = async () => {
     if (admin === null || picked.length === 0) return;
     const text = message.trim();
-    const room2 = await actions.createRoom([admin, ...picked], { admin, ...text ? {} : { greet: true } });
+    const room2 = await actions.createRoom([admin, ...picked], { admin, opId: groupOpId.current, ...text ? {} : { greet: true } });
     if (text) await actions.send(room2.id, text);
     actions.openSession(room2.id);
     close();
@@ -18313,7 +18317,7 @@ function NewChat({ mode, roster, actions }) {
       close();
       return;
     }
-    const room2 = await actions.createRoom(picked);
+    const room2 = await actions.createRoom(picked, { opId: groupOpId.current });
     await actions.send(room2.id, text);
     actions.openSession(room2.id);
     close();
@@ -26098,43 +26102,69 @@ function relayLabel(reply) {
       return null;
   }
 }
+function BotMessage({ texts: texts2, name }) {
+  return (0, import_react61.createElement)(
+    "div",
+    { className: "bt-group-msg" },
+    name === void 0 || name === null ? null : (0, import_react61.createElement)("span", { className: "bt-group-name" }, name),
+    (0, import_react61.createElement)(
+      "div",
+      { className: "bt-astack" },
+      texts2.map((text, index) => (0, import_react61.createElement)(
+        "div",
+        { className: "bt-msg", key: index },
+        (0, import_react61.createElement)(
+          "div",
+          { className: "bt-msg-line" },
+          (0, import_react61.createElement)("div", { className: "bt-bubble" }, (0, import_react61.createElement)(Text, { text }))
+        )
+      ))
+    )
+  );
+}
+function UserMessage({ item }) {
+  return (0, import_react61.createElement)(
+    "div",
+    { className: "bt-umsg", "data-pending": item.pending === true || void 0 },
+    (0, import_react61.createElement)(
+      "div",
+      { className: "bt-ustack" },
+      (0, import_react61.createElement)("div", { className: "bt-ubody" }, String(item.text ?? ""))
+    )
+  );
+}
 function Row4({ item }) {
   const kind = item?.kind;
   if (kind === "divider") {
-    return (0, import_react61.createElement)("div", { className: "bt-hub-divider" }, item.time ? new Date(item.time).toLocaleTimeString() : "");
+    return (0, import_react61.createElement)("div", { className: "bt-time-sep" }, item.time ? new Date(item.time).toLocaleTimeString() : "");
   }
   if (kind === "event") {
     const name = item.name ?? "Bot";
-    if (item.role === "report") return (0, import_react61.createElement)("div", { className: "bt-hub-event" }, `${t("Replies from")} ${t("a group chat")}`);
+    if (item.role === "report") return (0, import_react61.createElement)("div", { className: "bt-event" }, (0, import_react61.createElement)("span", null, `${t("Replies from")} ${t("a group chat")}`));
     const prefix = { stopped: t("Stopped by"), reply: t("Reply from") }[item.role] ?? t("Message from");
-    return (0, import_react61.createElement)("div", { className: "bt-hub-event" }, `${prefix} ${name}`);
+    return (0, import_react61.createElement)("div", { className: "bt-event" }, (0, import_react61.createElement)("span", null, `${prefix} ${name}`));
   }
   if (kind === "post") {
     const texts2 = Array.isArray(item.texts) && item.texts.length > 0 ? item.texts : [item.text];
-    return (0, import_react61.createElement)(
-      "div",
-      { className: "bt-hub-row bt-hub-bot" },
-      (0, import_react61.createElement)("div", { className: "bt-hub-who" }, item.name ?? "Bot"),
-      (0, import_react61.createElement)("div", { className: "bt-hub-bubble" }, texts2.map((text, index) => (0, import_react61.createElement)(Text, { key: index, text })))
-    );
+    return (0, import_react61.createElement)(BotMessage, { texts: texts2, name: item.name ?? null });
   }
   if (kind === "bot") {
     return (0, import_react61.createElement)(
       "div",
-      { className: "bt-hub-row bt-hub-bot" },
-      (0, import_react61.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react61.createElement)(Text, { text: item.text }))
+      { className: "bt-msg" },
+      (0, import_react61.createElement)(
+        "div",
+        { className: "bt-msg-line" },
+        (0, import_react61.createElement)("div", { className: "bt-bubble" }, (0, import_react61.createElement)(Text, { text: item.text }))
+      )
     );
   }
   if (kind === "user") {
-    return (0, import_react61.createElement)(
-      "div",
-      { className: "bt-hub-row bt-hub-user", "data-pending": item.pending === true || void 0 },
-      (0, import_react61.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react61.createElement)(Text, { text: item.text }))
-    );
+    return (0, import_react61.createElement)(UserMessage, { item });
   }
   if (kind === "relay") {
     const label = relayLabel(item.reply);
-    return label === null ? null : (0, import_react61.createElement)("div", { className: "bt-hub-event" }, label);
+    return label === null ? null : (0, import_react61.createElement)("div", { className: "bt-event" }, (0, import_react61.createElement)("span", null, label));
   }
   if (kind === "answer") {
     return (0, import_react61.createElement)(AnsweredReply, { node: { data: item } });
@@ -26144,10 +26174,10 @@ function Row4({ item }) {
   }
   if (kind === "closed") {
     if (item.question !== void 0) {
-      return (0, import_react61.createElement)("div", { className: "bt-hub-card" }, (0, import_react61.createElement)(SettledQuestion, { question: item.question, closed: item.closed }));
+      return (0, import_react61.createElement)(SettledQuestion, { question: item.question, closed: item.closed });
     }
     if (item.view !== void 0) {
-      return (0, import_react61.createElement)("div", { className: "bt-hub-card" }, (0, import_react61.createElement)(SettledQuestion, { question: { question: item.title || t("View") }, closed: item.closed }));
+      return (0, import_react61.createElement)(SettledQuestion, { question: { question: item.title || t("View") }, closed: item.closed });
     }
   }
   return null;
@@ -26314,7 +26344,7 @@ function HubChat({ id, kind, name, left, actions }) {
           }
         }
       }),
-      (0, import_react61.createElement)("button", { type: "button", className: "bt-hub-send", disabled: offline || sending || text.trim() === "", onClick: send }, sending ? "…" : t("Send"))
+      (0, import_react61.createElement)("button", { type: "button", className: "bt-hub-send", "aria-label": t("Send"), disabled: offline || sending || text.trim() === "", onClick: send }, sending ? "…" : (0, import_react61.createElement)(ArrowUpIcon))
     )
   );
 }
@@ -26328,16 +26358,8 @@ var HUB_CHAT_CSS = `
 .bt-hub-close{flex:none;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);cursor:pointer}
 .bt-hub-close:hover{background:var(--bt-hover)}
 .bt-hub-body{flex:1;min-height:0;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
-.bt-hub-row{display:flex;flex-direction:column;gap:3px;max-width:72%}
-.bt-hub-user{align-self:flex-end;align-items:flex-end}
-.bt-hub-bot{align-self:flex-start;align-items:flex-start}
-.bt-hub-who{font-size:11px;color:var(--bt-ink-2);padding:0 2px}
-.bt-hub-bubble{padding:8px 12px;border-radius:12px;font-size:14px;line-height:20px;white-space:pre-wrap;overflow-wrap:anywhere}
-.bt-hub-user .bt-hub-bubble{background:var(--bt-accent);color:var(--bt-main)}
-.bt-hub-bot .bt-hub-bubble{background:var(--bt-card);border:.5px solid var(--bt-line)}
-.bt-hub-divider{align-self:center;font-size:11px;color:var(--bt-ink-3)}
-.bt-hub-event{align-self:center;font-size:12px;color:var(--bt-ink-2)}
-.bt-hub-card{flex:none;width:100%}
+/* The hub replica has no avatar rail, so the group name sits flush against the bubble. */
+.bt-hub .bt-group-name{margin-left:0}
 .bt-hub-cards{display:flex;flex-direction:column;gap:8px;flex:none}
 .bt-hub-earlier{align-self:center;flex:none}
 .bt-hub-earlier-btn{padding:6px 14px;border-radius:999px;border:0;background:var(--bt-hover);color:var(--bt-ink-2);font:inherit;font-size:12px;cursor:pointer}
@@ -26345,10 +26367,16 @@ var HUB_CHAT_CSS = `
 .bt-hub-earlier-btn:disabled{opacity:.5;cursor:default}
 .bt-hub-empty{align-self:center;margin:auto;font-size:13px;color:var(--bt-ink-2)}
 .bt-hub-error{align-self:center;font-size:13px;color:var(--bt-danger)}
-.bt-hub-composer{display:flex;align-items:flex-end;gap:8px;padding:12px 16px;border-top:.5px solid var(--bt-line)}
-.bt-hub-input{flex:1;min-width:0;resize:none;padding:9px 12px;border-radius:12px;border:.5px solid var(--bt-line);background:var(--bt-card);color:var(--bt-ink);font:inherit;font-size:14px;line-height:20px;max-height:120px}
-.bt-hub-send{flex:none;padding:9px 16px;border-radius:12px;border:0;background:var(--bt-accent);color:var(--bt-main);font:inherit;font-size:14px;font-weight:600;cursor:pointer}
+/* The composer mirrors DSH's own [data-composer-card]: the same glass pill, input and
+   circular accent send button, drawn only with the theme tokens the shell defines. */
+.bt-hub-composer{flex:none;display:flex;align-items:center;gap:0;min-height:44px;margin:0 16px 13px;padding:7.5px;box-sizing:border-box;border-radius:22px;background:var(--bt-glass-bg);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);border:.5px solid var(--bt-glass-rim);box-shadow:var(--bt-glass-shadow);transition:border-color .15s ease}
+.bt-hub-composer:hover,.bt-hub-composer:focus-within{border-color:color-mix(in srgb,var(--bt-ink) 30%,transparent)}
+.bt-hub-input{flex:1;min-width:0;border:0;background:transparent;color:var(--bt-ink);font:inherit;font-size:14px;line-height:24px;padding:2px 8px;resize:none;max-height:120px;outline:none}
+.bt-hub-input::placeholder{color:color-mix(in srgb,var(--bt-ink) 36%,transparent)}
+.bt-hub-send{flex:none;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:var(--bt-accent);color:var(--bt-accent-ink);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:opacity .15s ease}
+.bt-hub-send:hover:not(:disabled){opacity:.9}
 .bt-hub-send:disabled{opacity:.5;cursor:default}
+.bt-hub-send svg{width:14px;height:14px}
 `;
 
 // src/client/overlays.js
