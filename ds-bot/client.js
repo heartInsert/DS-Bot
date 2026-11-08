@@ -3087,6 +3087,10 @@ function frameLayout({ viewport, sidebarWidth, pref, drawer = false, panel = nul
   }
   return { left, panel: panelState, room: Math.max(0, viewport - occupied) };
 }
+function conversationLeft({ viewport, sidebarWidth, pref, drawer = false }) {
+  const { left } = frameLayout({ viewport, sidebarWidth, pref, drawer });
+  return left === "open" ? sidebarWidth : left === "hidden" ? 0 : RAIL_WIDTH;
+}
 function dragColumn(x, viewport) {
   if (x < RAIL_SNAP) return { left: "rail", width: RAIL_WIDTH };
   const docks = viewport >= SIDEBAR_MIN + MIN_CHAT;
@@ -25887,8 +25891,28 @@ var BROWSER_CSS = `
 // src/client/hub-chat.js
 var import_react60 = require("react");
 var POLL_MS4 = 1e3;
+var messageSeq = 0;
+var newMessageId = () => `msg-${messageSeq += 1}-${Math.random().toString(36).slice(2, 8)}`;
+var mdLabels4 = () => ({ code: { copyLabel: t("Copy"), copiedLabel: t("Copied") }, footnotes: t("Footnotes") });
 function itemKey(item, index) {
   return item?.id ?? `${item?.kind ?? "item"}:${item?.seq ?? index}`;
+}
+function hubRows(items, pending) {
+  const list = Array.isArray(items) ? items : [];
+  if (pending === null || pending === void 0) return list;
+  if (list.some((item) => item?.kind === "user" && item.text === pending.text)) return list;
+  return [...list, { id: pending.messageId, kind: "user", text: pending.text, pending: true }];
+}
+function applyHubReply(view, reply) {
+  const cursor = typeof reply?.epoch === "string" ? { epoch: reply.epoch, revision: reply.revision } : null;
+  const offline = reply?.offline === true;
+  if (reply?.unchanged === true) {
+    return { view: { ...view ?? { items: [] }, offline }, cursor };
+  }
+  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [] }, cursor };
+}
+function Text({ text }) {
+  return (0, import_react60.createElement)(import_dsh_client_ui_primitives.MarkdownText, { text: String(text ?? ""), variant: "compact", labels: mdLabels4() });
 }
 function Row4({ item }) {
   const kind = item?.kind;
@@ -25904,33 +25928,46 @@ function Row4({ item }) {
       "div",
       { className: "bt-hub-row bt-hub-bot" },
       (0, import_react60.createElement)("div", { className: "bt-hub-who" }, item.name ?? "Bot"),
-      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, texts2.map((text, index) => (0, import_react60.createElement)("div", { key: index }, String(text ?? ""))))
+      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, texts2.map((text, index) => (0, import_react60.createElement)(Text, { key: index, text })))
     );
   }
   if (kind === "bot") {
     return (0, import_react60.createElement)(
       "div",
       { className: "bt-hub-row bt-hub-bot" },
-      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, String(item.text ?? ""))
+      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react60.createElement)(Text, { text: item.text }))
     );
   }
   if (kind === "user") {
     return (0, import_react60.createElement)(
       "div",
-      { className: "bt-hub-row bt-hub-user" },
-      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, String(item.text ?? ""))
+      { className: "bt-hub-row bt-hub-user", "data-pending": item.pending === true || void 0 },
+      (0, import_react60.createElement)("div", { className: "bt-hub-bubble" }, (0, import_react60.createElement)(Text, { text: item.text }))
     );
   }
   return null;
 }
-function HubChat({ id, kind, name, actions }) {
+function HubChat({ id, kind, name, left, actions }) {
   const [view, setView] = (0, import_react60.useState)(null);
   const [text, setText] = (0, import_react60.useState)("");
   const [sending, setSending] = (0, import_react60.useState)(false);
   const [error, setError] = (0, import_react60.useState)(null);
+  const [pending, setPending] = (0, import_react60.useState)(null);
+  const cursorRef = (0, import_react60.useRef)(null);
+  const viewRef = (0, import_react60.useRef)(null);
   const listRef = (0, import_react60.useRef)(null);
   const refresh = (0, import_react60.useCallback)(() => {
-    void Promise.resolve(actions.hubChat(id, kind)).then(setView, () => setView({ offline: true, items: [] }));
+    const cursor = cursorRef.current;
+    void Promise.resolve(actions.hubChat(id, kind, cursor)).then((reply) => {
+      const next = applyHubReply(viewRef.current, reply);
+      if (next.cursor !== null) cursorRef.current = next.cursor;
+      viewRef.current = next.view;
+      setView(next.view);
+    }, () => {
+      const offline2 = { ...viewRef.current ?? { items: [] }, offline: true };
+      viewRef.current = offline2;
+      setView(offline2);
+    });
   }, [id, kind, actions]);
   (0, import_react60.useEffect)(() => {
     refresh();
@@ -25941,25 +25978,30 @@ function HubChat({ id, kind, name, actions }) {
     const list = listRef.current;
     if (list === null) return;
     list.scrollTop = list.scrollHeight;
-  }, [view?.items?.length]);
+  }, [view?.items?.length, pending]);
   const send = () => {
     const value = text.trim();
     if (value === "" || sending) return;
+    const messageId = pending !== null ? pending.messageId : newMessageId();
+    setPending({ messageId, text: value });
     setSending(true);
+    setText("");
     setError(null);
-    void Promise.resolve(actions.hubSend(id, kind, value)).then(() => {
+    void Promise.resolve(actions.hubSend(id, kind, value, messageId)).then(() => {
       setSending(false);
+      setPending(null);
       refresh();
     }, (reason) => {
       setSending(false);
       setError(reason?.message ?? String(reason));
+      setText(value);
     });
   };
-  const items = Array.isArray(view?.items) ? view.items : [];
+  const items = hubRows(view?.items, sending ? pending : null);
   const offline = view?.offline === true;
   return (0, import_react60.createElement)(
     "div",
-    { className: "bt-hub", role: "dialog", "aria-label": t("Hub conversation") },
+    { className: "bt-hub", role: "region", "aria-label": t("Hub conversation"), style: { "--bt-hub-left": `${left}px` } },
     (0, import_react60.createElement)(
       "div",
       { className: "bt-hub-head" },
@@ -26001,7 +26043,7 @@ function HubChat({ id, kind, name, actions }) {
   );
 }
 var HUB_CHAT_CSS = `
-.bt-hub{position:fixed;inset:0;z-index:400;display:flex;flex-direction:column;background:var(--bt-main);color:var(--bt-ink)}
+.bt-hub{position:fixed;top:var(--dsh-frame-chrome-top,0px);left:var(--bt-hub-left,0px);right:0;bottom:0;z-index:20;display:flex;flex-direction:column;background:var(--bt-main);color:var(--bt-ink)}
 .bt-hub-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:.5px solid var(--bt-line)}
 .bt-hub-title{display:flex;align-items:center;gap:8px;min-width:0;flex:1}
 .bt-hub-name{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -26085,7 +26127,7 @@ function Overlays({ useRoster, useUi, useSessions, useSessionStatus, useActivity
     menu ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(ContextMenu, { key: `${menu.kind ?? ""}:${menu.id}:${menu.x}:${menu.y}`, menu, roster, actions, leaving: menuLeaving }), document.body) : null,
     settings ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(SettingsDialog, { page: settings.page, id: settings.id, roster, actions, useUpdate, leaving: settingsLeaving }), document.body) : null,
     owner ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(MemoryDialog, { key: owner.id, owner, actions, leaving: memoryLeaving }), document.body) : null,
-    ui2.hubChat ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(HubChat, { key: ui2.hubChat.id, id: ui2.hubChat.id, kind: ui2.hubChat.kind, name: ui2.hubChat.name, actions }), document.body) : null
+    ui2.hubChat ? (0, import_react_dom10.createPortal)((0, import_react61.createElement)(HubChat, { key: ui2.hubChat.id, id: ui2.hubChat.id, kind: ui2.hubChat.kind, name: ui2.hubChat.name, left: conversationLeft({ viewport: frameSnap.viewport, sidebarWidth: frameSnap.sidebarWidth, pref, drawer: ui2.leftDrawer === true }), actions }), document.body) : null
   );
 }
 
@@ -28276,9 +28318,11 @@ function apply(ctx) {
     // Whether this computer is a joined node, so its chat view reads the hub instead of
     // its own empty Sessions.
     isHubNode: () => roster.getSnapshot().multiDevice?.node?.paired === true,
-    hubChat: (id, kind) => call("hub-chat", kind === "room" ? { roomId: id } : { botId: id }),
+    // The cursor (the epoch+revision of the replica this window last read) lets the hub
+    // answer "unchanged" without the item list when nothing has moved.
+    hubChat: (id, kind, cursor) => call("hub-chat", { ...kind === "room" ? { roomId: id } : { botId: id }, ...cursor?.epoch !== void 0 ? { epoch: cursor.epoch, since: cursor.revision } : {} }),
     hubSend: (id, kind, text, messageId) => call("hub-send", { ...kind === "room" ? { roomId: id } : { botId: id }, text, messageId }),
-    openHubChat: (id, kind, name) => ui2.set((state) => ({ ...state, hubChat: { id, kind, name }, newChat: null, exchange: null, menu: null, palette: null })),
+    openHubChat: (id, kind, name) => ui2.set((state) => ({ ...state, hubChat: { id, kind, name }, details: null, view: "details", renaming: false, tab: null, newChat: null, exchange: null, menu: null, palette: null })),
     closeHubChat: () => ui2.set((state) => state.hubChat === null ? state : { ...state, hubChat: null }),
     openSession: (id) => {
       if (isAgentSessionId(id)) return actions.openAgentSession(id);

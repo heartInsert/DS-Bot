@@ -46,6 +46,16 @@ export function frameLayout({ viewport, sidebarWidth, pref, drawer = false, pane
 }
 
 /**
+ * The conversation area's left edge, in px: the width the left column occupies before
+ * the chat begins. The hub conversation and the Bot panel both sit to the right of it,
+ * so the sidebar stays visible and clickable beside them.
+ */
+export function conversationLeft({ viewport, sidebarWidth, pref, drawer = false }) {
+  const { left } = frameLayout({ viewport, sidebarWidth, pref, drawer })
+  return left === 'open' ? sidebarWidth : left === 'hidden' ? 0 : RAIL_WIDTH
+}
+
+/**
  * Where a drag of the column's edge to `x` lands: short of RAIL_SNAP the rail;
  * past it an open column of that width, docked while the chat keeps MIN_CHAT
  * beside it, else floating as a drawer.

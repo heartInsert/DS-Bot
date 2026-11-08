@@ -3,19 +3,59 @@
 // lives on the hub. This view reads the hub's replica through the node's worker and
 // sends back through the one writer, so a Bot or a group chat opens as the hub's live
 // conversation instead of a second, local one.
+//
+// It sits in the normal conversation area — not over the sidebar — so the user can keep
+// switching Bots and group chats in the sidebar while it is open. Its poll sends the
+// cursor of the replica it already holds, and the hub answers "unchanged" when nothing
+// has moved, so the poll stays cheap.
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
+import { MarkdownText } from './dsh-primitives.js'
 import { CloseIcon } from './icons.js'
 import { t } from './i18n.js'
 
 const POLL_MS = 1000
 
+let messageSeq = 0
+// A client id for a message the user is sending. It is kept for retries of that message
+// until the send succeeds — the hub dedupes on it — and a fresh one is made for the next.
+const newMessageId = () => `msg-${(messageSeq += 1)}-${Math.random().toString(36).slice(2, 8)}`
+
+const mdLabels = () => ({ code: { copyLabel: t('Copy'), copiedLabel: t('Copied') }, footnotes: t('Footnotes') })
+
 function itemKey(item, index) {
   return item?.id ?? `${item?.kind ?? 'item'}:${item?.seq ?? index}`
 }
 
+// The items to draw: the hub's list, with an optimistic send standing in for its message
+// until the hub's own copy arrives. Keyed by the client's message id, so the same message
+// is never drawn twice.
+export function hubRows(items, pending) {
+  const list = Array.isArray(items) ? items : []
+  if (pending === null || pending === undefined) return list
+  if (list.some(item => item?.kind === 'user' && item.text === pending.text)) return list
+  return [...list, { id: pending.messageId, kind: 'user', text: pending.text, pending: true }]
+}
+
+// How a hub-chat reply updates the held view. A full answer replaces the items and
+// advances the cursor; an "unchanged" answer carries no items and only refreshes the
+// online flag, so the poll stays cheap. The cursor is null until a reply names an epoch.
+export function applyHubReply(view, reply) {
+  const cursor = typeof reply?.epoch === 'string' ? { epoch: reply.epoch, revision: reply.revision } : null
+  const offline = reply?.offline === true
+  if (reply?.unchanged === true) {
+    return { view: { ...(view ?? { items: [] }), offline }, cursor }
+  }
+  return { view: { offline, items: Array.isArray(reply?.items) ? reply.items : [] }, cursor }
+}
+
+// A reply's markdown, through the same renderer the main conversation uses.
+function Text({ text }) {
+  return h(MarkdownText, { text: String(text ?? ''), variant: 'compact', labels: mdLabels() })
+}
+
 // A conversation item the hub served: a user message, a Bot reply, a group post, an
-// event line or a divider. Rendered plainly; the rich cells belong to the live DSH view
-// and are not needed for a node's read replica.
+// event line or a divider. Rendered with the same markdown helper the live view uses;
+// the rich cells belong to the live DSH view and are not needed for a node's replica.
 function Row({ item }) {
   const kind = item?.kind
   if (kind === 'divider') {
@@ -28,28 +68,44 @@ function Row({ item }) {
     const texts = Array.isArray(item.texts) && item.texts.length > 0 ? item.texts : [item.text]
     return h('div', { className: 'bt-hub-row bt-hub-bot' },
       h('div', { className: 'bt-hub-who' }, item.name ?? 'Bot'),
-      h('div', { className: 'bt-hub-bubble' }, texts.map((text, index) => h('div', { key: index }, String(text ?? '')))))
+      h('div', { className: 'bt-hub-bubble' }, texts.map((text, index) => h(Text, { key: index, text }))))
   }
   if (kind === 'bot') {
     return h('div', { className: 'bt-hub-row bt-hub-bot' },
-      h('div', { className: 'bt-hub-bubble' }, String(item.text ?? '')))
+      h('div', { className: 'bt-hub-bubble' }, h(Text, { text: item.text })))
   }
   if (kind === 'user') {
-    return h('div', { className: 'bt-hub-row bt-hub-user' },
-      h('div', { className: 'bt-hub-bubble' }, String(item.text ?? '')))
+    return h('div', { className: 'bt-hub-row bt-hub-user', 'data-pending': item.pending === true || undefined },
+      h('div', { className: 'bt-hub-bubble' }, h(Text, { text: item.text })))
   }
   return null
 }
 
-export function HubChat({ id, kind, name, actions }) {
+export function HubChat({ id, kind, name, left, actions }) {
   const [view, setView] = useState(null)
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState(null)
+  const [pending, setPending] = useState(null)
+  // The replica's cursor, sent back so an unchanged poll answers without the item list.
+  const cursorRef = useRef(null)
+  // The view the last apply produced, kept beside the state so a reply applies against
+  // the freshest items without re-subscribing the poll to them.
+  const viewRef = useRef(null)
   const listRef = useRef(null)
 
   const refresh = useCallback(() => {
-    void Promise.resolve(actions.hubChat(id, kind)).then(setView, () => setView({ offline: true, items: [] }))
+    const cursor = cursorRef.current
+    void Promise.resolve(actions.hubChat(id, kind, cursor)).then(reply => {
+      const next = applyHubReply(viewRef.current, reply)
+      if (next.cursor !== null) cursorRef.current = next.cursor
+      viewRef.current = next.view
+      setView(next.view)
+    }, () => {
+      const offline = { ...(viewRef.current ?? { items: [] }), offline: true }
+      viewRef.current = offline
+      setView(offline)
+    })
   }, [id, kind, actions])
 
   useEffect(() => {
@@ -62,26 +118,33 @@ export function HubChat({ id, kind, name, actions }) {
     const list = listRef.current
     if (list === null) return
     list.scrollTop = list.scrollHeight
-  }, [view?.items?.length])
+  }, [view?.items?.length, pending])
 
   const send = () => {
     const value = text.trim()
     if (value === '' || sending) return
+    // A message the user is retrying keeps the id the hub already saw for it.
+    const messageId = pending !== null ? pending.messageId : newMessageId()
+    setPending({ messageId, text: value })
     setSending(true)
+    setText('')
     setError(null)
-    void Promise.resolve(actions.hubSend(id, kind, value)).then(() => {
+    void Promise.resolve(actions.hubSend(id, kind, value, messageId)).then(() => {
       setSending(false)
+      setPending(null)
       refresh()
     }, reason => {
       setSending(false)
       setError(reason?.message ?? String(reason))
+      // The message was not sent: put the text back so a retry reuses the same id.
+      setText(value)
     })
   }
 
-  const items = Array.isArray(view?.items) ? view.items : []
+  const items = hubRows(view?.items, sending ? pending : null)
   const offline = view?.offline === true
 
-  return h('div', { className: 'bt-hub', role: 'dialog', 'aria-label': t('Hub conversation') },
+  return h('div', { className: 'bt-hub', role: 'region', 'aria-label': t('Hub conversation'), style: { '--bt-hub-left': `${left}px` } },
     h('div', { className: 'bt-hub-head' },
       h('div', { className: 'bt-hub-title' },
         h('span', { className: 'bt-hub-name' }, name ?? (kind === 'room' ? 'Group' : 'Bot')),
@@ -111,7 +174,7 @@ export function HubChat({ id, kind, name, actions }) {
 }
 
 export const HUB_CHAT_CSS = `
-.bt-hub{position:fixed;inset:0;z-index:400;display:flex;flex-direction:column;background:var(--bt-main);color:var(--bt-ink)}
+.bt-hub{position:fixed;top:var(--dsh-frame-chrome-top,0px);left:var(--bt-hub-left,0px);right:0;bottom:0;z-index:20;display:flex;flex-direction:column;background:var(--bt-main);color:var(--bt-ink)}
 .bt-hub-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:.5px solid var(--bt-line)}
 .bt-hub-title{display:flex;align-items:center;gap:8px;min-width:0;flex:1}
 .bt-hub-name{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

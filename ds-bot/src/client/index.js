@@ -500,9 +500,11 @@ export function apply(ctx) {
     // Whether this computer is a joined node, so its chat view reads the hub instead of
     // its own empty Sessions.
     isHubNode: () => roster.getSnapshot().multiDevice?.node?.paired === true,
-    hubChat: (id, kind) => call('hub-chat', kind === 'room' ? { roomId: id } : { botId: id }),
+    // The cursor (the epoch+revision of the replica this window last read) lets the hub
+    // answer "unchanged" without the item list when nothing has moved.
+    hubChat: (id, kind, cursor) => call('hub-chat', { ...(kind === 'room' ? { roomId: id } : { botId: id }), ...(cursor?.epoch !== undefined ? { epoch: cursor.epoch, since: cursor.revision } : {}) }),
     hubSend: (id, kind, text, messageId) => call('hub-send', { ...(kind === 'room' ? { roomId: id } : { botId: id }), text, messageId }),
-    openHubChat: (id, kind, name) => ui.set(state => ({ ...state, hubChat: { id, kind, name }, newChat: null, exchange: null, menu: null, palette: null })),
+    openHubChat: (id, kind, name) => ui.set(state => ({ ...state, hubChat: { id, kind, name }, details: null, view: 'details', renaming: false, tab: null, newChat: null, exchange: null, menu: null, palette: null })),
     closeHubChat: () => ui.set(state => (state.hubChat === null ? state : { ...state, hubChat: null })),
     openSession: (id) => {
       // A DSH Agent Session id lands on the plain surface, not the Bot skin.
