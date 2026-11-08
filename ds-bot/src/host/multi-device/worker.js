@@ -149,7 +149,7 @@ function runCommand(argv, timeoutMs, cwd) {
   })
 }
 
-export function createWorker({ hubUrl, dataDir, name, code, sync, log = () => {}, reconnectMs = 1000, maxReconnectMs = 30_000, heartbeatMs = 20_000, now = Date.now } = {}) {
+export function createWorker({ hubUrl, dataDir, name, code, sync, onTeam, log = () => {}, reconnectMs = 1000, maxReconnectMs = 30_000, heartbeatMs = 20_000, now = Date.now } = {}) {
   if (typeof hubUrl !== 'string' || hubUrl === '') throw new Error('createWorker needs the hub URL')
   if (typeof dataDir !== 'string' || dataDir === '') throw new Error('createWorker needs a dataDir')
   const base = hubUrl.replace(/\/+$/, '')
@@ -195,6 +195,7 @@ export function createWorker({ hubUrl, dataDir, name, code, sync, log = () => {}
       bot: follow.bot,
       ...(Number.isInteger(follow.pollMs) ? { pollMs: follow.pollMs } : {}),
       ...(Number.isInteger(follow.waitMs) ? { waitMs: follow.waitMs } : {}),
+      ...(typeof onTeam === 'function' ? { onTeam } : {}),
       log,
       now,
     })

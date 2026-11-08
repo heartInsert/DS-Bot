@@ -80,6 +80,7 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
   const epoch = randomBytes(8).toString('hex')
   let revision = 0
   let teamRevision = 0
+  let teamGeneration = 0
   let lastTeamKey = undefined
   const entries = new Map()
   const waiters = new Map()
@@ -379,6 +380,17 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
     for (const done of set) done()
   }
 
+  // A team write changed the roster; every node's waiting poll returns now so it re-reads
+  // the team list promptly instead of on its slow timer. The generation lets a snapshot
+  // tell "the team changed" apart from "the conversation changed".
+  function wakeTeam() {
+    teamGeneration += 1
+    for (const [key, set] of [...waiters.entries()]) {
+      waiters.delete(key)
+      for (const done of set) done()
+    }
+  }
+
   // `before` names where an earlier page begins: the cursor a snapshot handed back
   // (`{part, beforeSeq}`), a bare seq, or a stable item id (`session:seq:n`). The seq
   // forms page the current part; the cursor form can cross into earlier parts.
@@ -505,11 +517,15 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
       return { ...viewOf(entry), reset, unchanged: !reset && upToDate }
     }
     const started = now()
+    const teamAt = teamGeneration
     while (!reset && now() - started < wanted) {
       const left = wanted - (now() - started)
       await waitForChange(key, Math.min(left, refreshMs))
       entry = await refresh(reference)
       if (entry.revision !== current) return { ...viewOf(entry), reset: false, unchanged: false }
+      // The team changed while this poll waited: answer now so the node re-reads the
+      // team list; the conversation itself is unchanged.
+      if (teamGeneration !== teamAt) return { ...viewOf(entry), reset: false, unchanged: true, teamChanged: true }
     }
     return { ...viewOf(entry), reset: false, unchanged: true }
   }
@@ -686,6 +702,8 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
     answerView,
     dismissQuestion,
     dismissView,
+    // A team write woke every poll so each node re-reads the team list now.
+    wakeTeam,
     // The Devices page and tests read this without touching a node.
     status: () => ({
       epoch,

@@ -7,6 +7,7 @@ import { CreateBot } from './create-bot.js'
 import { QUICK_EDGES, useFlip, useGlide, useMorph } from './motion.js'
 import { t } from './i18n.js'
 import { sendsOnEnter } from './enter-key.js'
+import { newOpId } from './team-actions.js'
 
 export function NewChat({ mode, roster, actions }) {
   const [query, setQuery] = useState('')
@@ -21,6 +22,8 @@ export function NewChat({ mode, roster, actions }) {
   // The Create Bot form, opened straight from 'create' mode or from the list.
   const [draft, setDraft] = useState(mode === 'create' ? { name: '', fromList: false } : null)
   const inputRef = useRef(null)
+  // One op id for the group this pane makes, so a retry asks for the same group.
+  const groupOpId = useRef(newOpId())
   const close = () => actions.closeOverlay()
   useEscape(close)
   const paneLeft = usePaneLeft()
@@ -72,7 +75,7 @@ export function NewChat({ mode, roster, actions }) {
   const makeGroup = async () => {
     if (admin === null || picked.length === 0) return
     const text = message.trim()
-    const room = await actions.createRoom([admin, ...picked], { admin, ...(text ? {} : { greet: true }) })
+    const room = await actions.createRoom([admin, ...picked], { admin, opId: groupOpId.current, ...(text ? {} : { greet: true }) })
     if (text) await actions.send(room.id, text)
     actions.openSession(room.id)
     close()
@@ -88,7 +91,7 @@ export function NewChat({ mode, roster, actions }) {
       close()
       return
     }
-    const room = await actions.createRoom(picked)
+    const room = await actions.createRoom(picked, { opId: groupOpId.current })
     await actions.send(room.id, text)
     actions.openSession(room.id)
     close()

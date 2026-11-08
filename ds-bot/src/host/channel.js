@@ -139,6 +139,15 @@ export function install(rt) {
   // Updates change the dsh profile, not the team, so a reading host may run them too.
   const READS = new Set(['state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'multi-device-status', 'hub-chat'])
 
+  // Whether this computer is a joined node, so its team writes go to the hub through the
+  // device token instead of this machine's own (empty) team.
+  const isHubNode = () => rt.multiDeviceView?.()?.node?.paired === true
+  const forwardTeamWrite = (op, payload, body) => rt.multiDeviceTeamWrite({
+    op,
+    payload,
+    ...(typeof body?.opId === 'string' && body.opId !== '' ? { opId: body.opId } : {}),
+  })
+
   async function setPrefs(body) {
     if (body.theme !== undefined) {
       if (typeof body.theme !== 'string' || !/^[a-z][\w-]{0,31}$/.test(body.theme)) throw invalid('Unknown theme')
@@ -236,6 +245,7 @@ export function install(rt) {
         case 'provider-remove':
           return ok(await rt.removeProvider(String(body.provider ?? '')))
         case 'duplicate-bot':
+          if (isHubNode()) return ok(await forwardTeamWrite('duplicate-bot', { id: body.id }, body))
           await rt.load()
           return ok(await rt.duplicateBot(body.id))
         case 'set-prefs':
@@ -285,11 +295,18 @@ export function install(rt) {
           return ok([...rt.roomProgress.entries()].filter(([, entry]) => entry.roomId === (room?.id ?? body.roomId)).map(([callId, entry]) => ({ callId, replies: entry.replies, speaking: entry.slots.filter(slot => slot.status === 'speaking').map(slot => slot.id) })))
         }
         case 'create-bot': {
+          if (isHubNode()) {
+            return ok(await forwardTeamWrite('create-bot', {
+              name: body.name, role: body.role, color: body.color, instructions: body.instructions,
+              brief: body.brief, avatar: body.avatar, model: body.model, effort: body.effort, workDir: body.workDir,
+            }, body))
+          }
           await rt.bootstrap()
           const bot = await rt.createBot({ name: body.name, role: body.role, color: body.color, instructions: body.instructions, brief: body.brief, avatar: body.avatar, model: body.model, effort: body.effort, workDir: body.workDir })
           return ok(bot)
         }
         case 'update-bot':
+          if (isHubNode()) return ok(await forwardTeamWrite('update-bot', { id: body.id, ...body }, body))
           await rt.load()
           return ok(await rt.updateBot(body.id, body))
         // The repair card's Retry, once the user fixed what failed the Bot's turn.
@@ -311,14 +328,17 @@ export function install(rt) {
           await rt.load()
           return ok(await rt.avatarLibraryDelete(String(body.id ?? '')))
         case 'delete-bot':
+          if (isHubNode()) return ok(await forwardTeamWrite('delete-bot', { id: body.id }, body))
           await rt.load()
           await rt.deleteBot(body.id)
           return ok(view())
         case 'private-release':
+          if (isHubNode()) return ok(await forwardTeamWrite('private-release', { id: body.id }, body))
           await rt.load()
           await rt.releaseArchive(String(body.id ?? ''))
           return ok(view())
         case 'set-main':
+          if (isHubNode()) return ok(await forwardTeamWrite('set-main', { id: body.id, main: body.main, primary: body.primary, replace: body.replace }, body))
           await rt.load()
           await rt.setMain(body.id, body.main !== false, {
             primary: body.primary === true,
@@ -326,12 +346,29 @@ export function install(rt) {
           })
           return ok(view())
         case 'create-room': {
+          if (isHubNode()) {
+            return ok(await forwardTeamWrite('create-room', {
+              members: Array.isArray(body.members) ? body.members : [],
+              name: body.name,
+              ...(typeof body.admin === 'string' ? { admin: body.admin } : {}),
+              greet: body.greet === true,
+            }, body))
+          }
           await rt.load()
           const room = await rt.createRoom({ members: Array.isArray(body.members) ? body.members : [], name: body.name, ...(typeof body.admin === 'string' ? { admin: body.admin } : {}) })
           if (body.greet === true) await rt.greetRoom(room.id).catch(error => rt.warn('ds-bot: greeting in %s failed: %s', room.name, error))
           return ok(room)
         }
         case 'update-room': {
+          if (isHubNode()) {
+            return ok(await forwardTeamWrite('update-room', {
+              id: body.id, name: body.name, notice: body.notice, mode: body.mode, admin: body.admin,
+              members: Array.isArray(body.members) ? body.members : undefined,
+              add: Array.isArray(body.add) ? body.add : undefined,
+              remove: Array.isArray(body.remove) ? body.remove : undefined,
+              workDir: body.workDir, permission: body.permission,
+            }, body))
+          }
           await rt.load()
           const { room, changes } = await rt.updateRoom(body.id, {
             name: body.name,
@@ -376,9 +413,11 @@ export function install(rt) {
           await rt.removeAgent(body.agentId)
           return ok(view())
         case 'set-flags':
+          if (isHubNode()) return ok(await forwardTeamWrite('set-flags', { id: body.id, ...body }, body))
           await rt.load()
           return ok(await rt.setFlags(body.id, body))
         case 'delete-room':
+          if (isHubNode()) return ok(await forwardTeamWrite('delete-room', { id: body.id }, body))
           await rt.load()
           await rt.deleteRoom(body.id)
           return ok(view())

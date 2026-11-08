@@ -9,6 +9,7 @@ import { createPayload, freshBotName, startModel } from './bot-draft.js'
 import { ModelMenu } from './model-menu.js'
 import { hostText, t } from './i18n.js'
 import { nameProblem } from '../shared/mentions.js'
+import { newOpId } from './team-actions.js'
 
 const pick = list => list[Math.floor(Math.random() * list.length)]
 const randomLook = (avoid = {}) => {
@@ -30,6 +31,9 @@ export function CreateBot({ roster, actions, start, brief = '', onBack, canGoBac
   const [error, setError] = useState('')
   const fileRef = useRef(null)
   const frame = useRef(null)
+  // One op id for this form, so a retry after a flaky link asks the hub for the same
+  // Bot instead of creating a second one.
+  const opId = useRef(newOpId())
   useEscape(onBack)
   // Inside Settings the form opens below other sections, so it scrolls itself into view.
   useEffect(() => { if (inline) frame.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }) }, [])
@@ -42,7 +46,7 @@ export function CreateBot({ roster, actions, start, brief = '', onBack, canGoBac
     setError('')
     setBusy(true)
     try {
-      const bot = await actions.createBot(createPayload({ name: finalName, look, image, model, effort, brief }))
+      const bot = await actions.createBot(createPayload({ name: finalName, look, image, model, effort, brief }), opId.current)
       onCreated(bot)
     } catch (failure) {
       setError(failure?.message ?? String(failure))

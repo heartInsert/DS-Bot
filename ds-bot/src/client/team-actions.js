@@ -1,6 +1,12 @@
 import { approvalChat, countCards, heldCardKey } from './sources.js'
 import { noteClientError } from './diagnostics.js'
 
+let opSeq = 0
+// A client id for a team write (create a Bot or a group chat). It is kept for retries
+// of that write until the hub accepts it — the hub dedupes on it — so a retry after a
+// flaky link never makes two Bots.
+export const newOpId = () => `op-${(opSeq += 1)}-${Math.random().toString(36).slice(2, 8)}`
+
 // The actions every window that draws the Bot views shares: dialogs and panels (the `ui`
 // source), requests to the host, and the notes the transcript keeps. The shell around the
 // views adds navigation and its own panels. `after` reads the team again once a request
@@ -88,7 +94,7 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     openMenu: (menu) => { ui.set(state => ({ ...state, menu, palette: null })) },
     closeMenu: () => { ui.set(state => (state.menu ? { ...state, menu: null } : state)) },
     closeOverlay: () => { ui.set(state => ({ ...state, newChat: null, exchange: null, details: state.newChat || state.exchange ? state.details : null })) },
-    createBot: payload => after(call('create-bot', payload)),
+    createBot: (payload, opId) => after(call('create-bot', { ...payload, ...(opId ? { opId } : {}) })),
     // The avatar library: photos the user imported once, kept by the host.
     avatarLibrary: (options = {}) => call('avatar-library', options),
     importAvatars: items => call('avatar-import', { items }),

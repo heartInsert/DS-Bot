@@ -16,7 +16,8 @@ import { APPROVED_NOTE, classifyCommand, describePolicy } from './policy.js'
 import { MAX_FILE_BYTES, taskLabel } from './protocol.js'
 import { bestDevice, hintedDevice } from './select.js'
 import { createSessionSync } from './session-sync.js'
-import { backupTeam, createTeamSource, syncTeam, teamApplyMarkerPath } from './team-sync.js'
+import { createTeamWrite } from './team-write.js'
+import { backupTeam, createTeamSource, readUnsyncedLocalTeam, recordUnsyncedLocalTeam, syncTeam, teamApplyMarkerPath } from './team-sync.js'
 
 const DEFAULT_PORT = 8787
 const DEFAULT_WAIT_MS = 20_000
@@ -491,6 +492,14 @@ export function install(rt) {
   } catch (error) {
     rt.warn('ds-bot: LAN session sync is off: %s', error.message)
   }
+  // The hub applies a node's team writes with its own rt functions and keeps accepted
+  // op ids, so a create on a node lands once on the hub and everywhere else.
+  let teamWrite
+  try {
+    teamWrite = createTeamWrite({ rt, dataDir: options.dataDir, log: (...args) => rt.warn(...args) })
+  } catch (error) {
+    rt.warn('ds-bot: LAN team writes are off: %s', error.message)
+  }
   // The team this computer would hand to a machine that joins it. Like the conversation,
   // it reads the live team each time, so an edit made a second ago is in the next join.
   const teamSync = createTeamSource({ state: () => rt.state, home: () => rt.home, name: options.name })
@@ -586,7 +595,7 @@ export function install(rt) {
       try {
         // The plugin runs the hub, so the shortest path is one process. The CLI can also
         // read the same data folder (nodes.json, admin.token) while this hub runs.
-        hub = createHub({ ...options, sessionSync, teamSync, log: () => {} })
+        hub = createHub({ ...options, sessionSync, teamSync, teamWrite, log: () => {} })
       } catch (error) {
         hub = undefined
         phase = 'failed'
@@ -685,6 +694,8 @@ export function install(rt) {
       dataDir: options.dataDir,
       name: saved.nodeName,
       sync: 'main',
+      // A team change the hub signalled re-applies the hub's team here, promptly.
+      onTeam: () => { void refreshTeam().catch(() => {}) },
       log: (message, ...args) => rt.warn(message, ...args),
     })
     nodeError = undefined
@@ -730,8 +741,45 @@ export function install(rt) {
       // local team from loading.
       lastSync = undefined
       rt.warn('ds-bot lan: the hub team could not be read: %s', error.message)
+      return lastSync
     }
+    // A take-over may have left Bots or groups the hub did not know. Once connected,
+    // submit them to the hub as creates, so nothing the user made is lost.
+    void migrateUnsynced().catch(error => rt.warn('ds-bot lan: could not migrate the local team: %s', error.message))
     return lastSync
+  }
+
+  // Submits the local Bots and group chats a take-over recorded to the hub as creates.
+  // Each write keeps the recorded entry until it is accepted, so an offline moment only
+  // delays the migration; nothing is deleted until it lands.
+  const migrateUnsynced = async () => {
+    const session = nodeWorker?.session?.()
+    if (session === undefined) return
+    const recorded = readUnsyncedLocalTeam(options.dataDir)
+    if (recorded === undefined) return
+    const remaining = { bots: [], rooms: [] }
+    for (const bot of recorded.bots ?? []) {
+      try {
+        await session.teamWrite('create-bot', {
+          name: bot.name, role: bot.role, color: bot.color, instructions: bot.instructions,
+          brief: bot.brief, avatar: bot.avatar, model: bot.model, effort: bot.effort,
+        })
+      } catch {
+        remaining.bots.push(bot)
+      }
+    }
+    for (const room of recorded.rooms ?? []) {
+      try {
+        await session.teamWrite('create-room', {
+          members: Array.isArray(room.members) ? room.members : [],
+          name: room.name,
+          ...(typeof room.admin === 'string' ? { admin: room.admin } : {}),
+        })
+      } catch {
+        remaining.rooms.push(room)
+      }
+    }
+    recordUnsyncedLocalTeam(options.dataDir, remaining)
   }
 
   const saveJoined = async (value) => {
@@ -938,6 +986,24 @@ export function install(rt) {
   const hubViewAnswer = (body = {}) => hubCardAnswer(session => answerHubView(session, hubReference(body), String(body?.viewId ?? ''), body?.action, body?.values))
   const hubViewDismiss = (body = {}) => hubCardAnswer(session => dismissHubView(session, hubReference(body)))
 
+  // A team write the node forwards to the hub: create, rename or delete a Bot or a group
+  // chat. The device token authorizes it; an offline hub fails clearly instead of a fake
+  // local success, and the op id makes a retry idempotent on the hub.
+  const nodeTeamWrite = async (body = {}) => {
+    const session = nodeWorker?.session?.()
+    if (session === undefined) throw new Error('This computer is not joined to a hub.')
+    try {
+      const result = await session.teamWrite(body?.op, body?.payload ?? {}, typeof body?.opId === 'string' && body.opId !== '' ? { opId: body.opId } : {})
+      // This node changed the hub's team; bring its own copy over without waiting for a
+      // poll, so the new Bot or group is on the roster at once.
+      void refreshTeam().catch(() => {})
+      return result
+    } catch (error) {
+      if (error?.code === 'hub/offline' || error?.fatal === true || error?.code === 'bot/invalid') throw error
+      throw new Error(`The hub is not reachable; the change was not made. ${error?.message ?? ''}`.trim())
+    }
+  }
+
   Object.defineProperty(rt, 'multiDeviceEnabled', { get: () => enabled, configurable: true })
   Object.defineProperty(rt, 'multiDeviceError', { get: () => failure, configurable: true })
   Object.assign(rt, {
@@ -965,6 +1031,8 @@ export function install(rt) {
     multiDeviceHubQuestionDismiss: hubQuestionDismiss,
     multiDeviceHubViewAnswer: hubViewAnswer,
     multiDeviceHubViewDismiss: hubViewDismiss,
+    // A team write the node forwards to the hub, applied there and returned with its id.
+    multiDeviceTeamWrite: nodeTeamWrite,
   })
 
   // The saved choice is read once the team file is loaded; the profile only supplies

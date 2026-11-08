@@ -389,6 +389,64 @@ export function teamApplyMarkerPath(dataDir) {
   return join(dataDir, 'team-sync.json')
 }
 
+// Where a node records the local Bots and group chats the hub's bundle does not know,
+// so a take-over never drops them silently: they are kept in the backup and listed here,
+// and migrated to the hub as creates once the node is connected.
+export const UNSYNCED_LOCAL_FILE = 'unsynced-local.json'
+export function unsyncedLocalPath(dataDir) {
+  return join(dataDir, UNSYNCED_LOCAL_FILE)
+}
+
+/** The local Bots and group chats the hub's team does not name, as `{ bots, rooms }`. */
+export function unsyncedLocalTeam(localState, hubTeam) {
+  const hubBots = hubTeam?.bots ?? {}
+  const hubRooms = hubTeam?.rooms ?? {}
+  const bots = []
+  const rooms = []
+  for (const [id, bot] of Object.entries(localState?.bots ?? {})) {
+    if (hubBots[id] === undefined) bots.push(bot)
+  }
+  for (const [id, room] of Object.entries(localState?.rooms ?? {})) {
+    if (hubRooms[id] === undefined) rooms.push(room)
+  }
+  return { bots, rooms }
+}
+
+/** Writes the unsynced local team to the node data dir, or clears it when there is none. */
+export function recordUnsyncedLocalTeam(dataDir, entries, { now = Date.now } = {}) {
+  if (typeof dataDir !== 'string' || dataDir === '') throw new Error('recording the local team needs the multi-device data folder')
+  const bots = Array.isArray(entries?.bots) ? entries.bots : []
+  const rooms = Array.isArray(entries?.rooms) ? entries.rooms : []
+  const path = unsyncedLocalPath(dataDir)
+  if (bots.length === 0 && rooms.length === 0) {
+    try {
+      unlinkSync(path)
+    } catch {
+      // Already gone: nothing unsynced to keep.
+    }
+    return { bots: [], rooms: [] }
+  }
+  const recorded = { recordedAt: new Date(now()).toISOString(), bots, rooms }
+  writeAtomic(path, `${JSON.stringify(recorded, null, 2)}\n`)
+  return recorded
+}
+
+/** Reads the unsynced local team a previous take-over recorded, if any. */
+export function readUnsyncedLocalTeam(dataDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(unsyncedLocalPath(dataDir), 'utf8'))
+    if (parsed !== null && typeof parsed === 'object') {
+      return {
+        bots: Array.isArray(parsed.bots) ? parsed.bots : [],
+        rooms: Array.isArray(parsed.rooms) ? parsed.rooms : [],
+      }
+    }
+  } catch {
+    // No record yet, or one this version cannot read.
+  }
+  return undefined
+}
+
 /** What this node last applied, so a reconnect with nothing new writes nothing. */
 export function readApplyMarker(dataDir) {
   try {
@@ -423,6 +481,14 @@ export async function syncTeam({ rt, hubUrl, token, dataDir, hubId, backup, time
   if (sameBundle(marker, keyed)) {
     return { applied: false, unchanged: true, revision: bundle.revision, hub: bundle.hub ?? null, backup: backup?.dir ?? null }
   }
+  // Before the hub's team replaces the local one, remember the Bots and group chats this
+  // machine holds that the hub does not, so a take-over never drops them silently.
+  let unsynced
+  try {
+    unsynced = recordUnsyncedLocalTeam(dataDir, unsyncedLocalTeam(rt.state, bundle.team))
+  } catch (error) {
+    log('ds-bot lan: could not record the unsynced local team: %s', error.message)
+  }
   const result = await applyTeamBundle({ rt, bundle, backup })
   writeApplyMarker(dataDir, {
     hubId,
@@ -434,7 +500,7 @@ export async function syncTeam({ rt, hubUrl, token, dataDir, hubId, backup, time
     memory: result.memory,
   })
   log('ds-bot lan: took over the team from %s (%d bots, %d memory files)', bundle.hub ?? hubUrl, result.bots, result.memory)
-  return { ...result, hubId }
+  return { ...result, hubId, unsynced: { bots: unsynced?.bots?.length ?? 0, rooms: unsynced?.rooms?.length ?? 0 } }
 }
 
 const baseOf = hubUrl => String(hubUrl ?? '').replace(/\/+$/, '')

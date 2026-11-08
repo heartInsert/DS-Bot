@@ -282,7 +282,7 @@ export function createSessionClient({
     lastSyncedAt = iso()
     if (body.unchanged === true) {
       status = 'syncing'
-      return { unchanged: true, revision: body.revision, epoch: body.epoch }
+      return { unchanged: true, revision: body.revision, epoch: body.epoch, teamChanged: body.teamChanged === true }
     }
     const incoming = {
       version: 1,
@@ -312,7 +312,7 @@ export function createSessionClient({
     if (active === key) activeName = incoming.botName ?? incoming.roomName ?? activeName
     writeReplica(dataDir, conv.replica)
     status = 'syncing'
-    return { ...conv.replica, reset: body.reset === true }
+    return { ...conv.replica, reset: body.reset === true, teamChanged: body.teamChanged === true }
   }
 
   async function loop() {
@@ -327,9 +327,10 @@ export function createSessionClient({
         }
         lastError = undefined
         backoff = Math.max(500, Math.min(pollMs, 5_000))
-        // The team list is re-read on a timer, not only when a conversation changes, so a
-        // Bot or a group chat created, renamed or deleted on the hub reaches the node.
-        if (now() - lastTeamRefresh >= teamPollMs) {
+        // The team list is re-read when the conversation changed or the hub signalled a
+        // team change (a Bot or group created, renamed or deleted), and on the slow timer
+        // as a fallback, so a change reaches this node promptly, not after a long poll.
+        if (result.teamChanged === true || result.unchanged !== true || now() - lastTeamRefresh >= teamPollMs) {
           lastTeamRefresh = now()
           await refreshTeam().catch(() => {})
         }
@@ -466,6 +467,23 @@ export function createSessionClient({
       if (!response.ok) throw failure(answer.error ?? `the hub refused the message: HTTP ${response.status}`, { code: response.status === 503 ? 'hub/offline' : undefined })
       if (!running) void pullOnce().catch(error => { lastError = error.message })
       return { ...answer, messageId }
+    },
+    // A team write (create/rename/delete a Bot or a group chat) the node forwards to the
+    // hub. The device token authorizes it; the op id makes a retry idempotent, and the
+    // answer carries the stable id the hub assigned. An offline hub is a clear failure,
+    // never a made-up local success.
+    async teamWrite(op, payload = {}, { opId = randomUUID() } = {}) {
+      let response
+      try {
+        response = await request('/team/write', { method: 'POST', body: JSON.stringify({ op, payload, opId }), timeoutMs: REQUEST_TIMEOUT_MS })
+      } catch (error) {
+        throw failure(`the hub is not reachable; the change was not made (${error.message})`, { code: 'hub/offline' })
+      }
+      const answer = await response.json().catch(() => ({}))
+      if (response.status === 401) throw failure('the hub does not know this device; pair it again', { fatal: true })
+      if (response.status === 400) throw failure(answer.error ?? 'Nothing to change', { code: 'bot/invalid' })
+      if (!response.ok) throw failure(answer.error ?? `the hub refused the change: HTTP ${response.status}`, { code: response.status === 503 ? 'hub/offline' : undefined })
+      return answer
     },
     // A card answer the node forwards to the hub. The reference names the Bot whose
     // chat holds the card; the hub resolves it and answers idempotently by card id.

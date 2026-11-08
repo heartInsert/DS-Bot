@@ -152,7 +152,7 @@ function adminToken(dataDir) {
   return { token, file, created: true }
 }
 
-export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS Bot hub', sessionSync, teamSync, discovery = true, discoveryPort = DISCOVERY_PORT, log = () => {}, now = Date.now } = {}) {
+export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS Bot hub', sessionSync, teamSync, teamWrite, discovery = true, discoveryPort = DISCOVERY_PORT, log = () => {}, now = Date.now } = {}) {
   if (typeof dataDir !== 'string' || dataDir === '') throw new Error('createHub needs a dataDir')
   mkdirSync(dataDir, { recursive: true })
   const registry = createRegistry({ dataDir, now, log })
@@ -619,6 +619,23 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     return send(response, 200, await teamSync.snapshot())
   }
 
+  // A node's team write: create, rename or delete a Bot or a group chat, applied here
+  // with the hub's own functions so the hub stays the one owner. The op id makes a
+  // retry idempotent, and the answer carries the stable id back to the node.
+  async function handleTeamWrite(request, response) {
+    const node = registry.findByToken(bearer(request))
+    if (node === undefined) return send(response, 401, { error: 'the device token is not known to this hub' })
+    if (teamWrite === undefined) {
+      return send(response, 503, { error: 'this hub does not accept team writes' })
+    }
+    registry.touch(node.id)
+    const body = await readJson(request)
+    const result = await teamWrite.apply({ op: body.op, payload: body.payload ?? {}, opId: body.opId })
+    // A change makes every node re-read the team now instead of on its slow timer.
+    sessionSync?.wakeTeam?.()
+    return send(response, 200, { ...result, node: node.name })
+  }
+
   async function handleAdmin(request, response, path) {
     const given = String(request.headers['x-admin-token'] ?? '')
     if (!sameSecret(given, secret.token)) return send(response, 401, { error: 'the admin token is required' })
@@ -688,6 +705,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       || path === '/session/approval' || path === '/session/question' || path === '/session/question-dismiss'
       || path === '/session/view' || path === '/session/view-dismiss') return handleSession(request, response, path, target.searchParams)
     if (path === '/team') return handleTeam(request, response)
+    if (path === '/team/write') return handleTeamWrite(request, response)
     if (path.startsWith('/admin/')) return handleAdmin(request, response, path)
     return send(response, 404, { error: 'not found' })
   }
