@@ -1,4 +1,4 @@
-# LAN multi-device (v3)
+# LAN multi-device (v4)
 
 A hub on the machine the user sits at, and a worker on another machine in the same
 network. The worker dials the hub and holds one server-sent-events connection; the hub
@@ -14,14 +14,24 @@ the Session and never writes the team's `state.json`; after a drop it resumes fr
 saved `{epoch, revision}` cursor.
 
 The hub runs **inside the DS Bot plugin process**. Settings → Devices turns it on and
-off, shows whether it is listening, lists the paired machines, makes a pairing code
-with the worker command, removes a machine, copies the daemon install command and the
-shared session address. A Devices strip above the sidebar account row shows how many
-paired machines are online. Bots use seven tools (`list_devices`, `run_on_device`,
-`device_read_file`, `device_write_file`, `device_transfer`, `device_task`,
-`device_pairing_code`), so a Bot picks the machine that fits the task instead of the
-user choosing per command. A worker stays a separate process on the other machine and
-needs Node only — no DSH, no DS Bot. The CLI remains for debugging.
+off, shows whether it is listening, lists the paired machines with an Allow/Deny line
+for each machine that asks to join, removes a machine, and copies the shared session
+address. A machine that is not a hub lists the hubs it finds on the same network and
+joins one with a button; its worker then runs inside its own plugin process, so an
+installed copy needs no terminal. Bots use seven tools (`list_devices`,
+`run_on_device`, `device_read_file`, `device_write_file`, `device_transfer`,
+`device_task`, `device_pairing_code`), so a Bot picks the machine that fits the task
+instead of the user choosing per command. A worker stays a separate process when the
+machine has Node only — no DSH, no DS Bot. The CLI remains for debugging.
+
+Finding a hub needs no address. The hub answers one UDP probe on port 8789
+(`discovery.js`); the probe goes out first from an ephemeral socket, so a host firewall
+sees a reply to an outbound datagram, and the URL is built from the address the answer
+arrived on. The machine then asks `POST /join` with its name, hostname and OS
+(`join.js`); the hub keeps it as a pending request, `GET /join/<id>` long-polls for the
+answer, and only `approveJoin` (the Allow button) creates the node and hands back a
+token. A denied or expired request pairs nothing. The six-digit code stays for a machine
+that runs the worker from the CLI, or for a network where the probe is blocked.
 
 ```mermaid
 flowchart LR
@@ -78,7 +88,7 @@ The design and the full protocol are in
 npm run lan:nodes
 npm run lan:run -- --node windows-pc -- hostname
 
-# on the worker machine
+# on a machine with Node only (the Devices page joins with no command)
 npm run lan:worker -- --hub http://192.168.1.23:8787 --code 123456 --name windows-pc
 npm run lan:daemon -- install --hub http://192.168.1.23:8787 --name windows-pc
 npm run lan:say -- --text "hello from this machine" --hub http://192.168.1.23:8787
@@ -94,19 +104,24 @@ Data lives in `~/.ds-bot/multi-device` unless `--data` or `DSBOT_LAN_DATA` says 
 | File | What it holds |
 |---|---|
 | `pairing.js` | Pairing codes (single use, 5 minutes) and token hashing |
+| `discovery.js` | The UDP probe and answer that find a hub on the same network |
+| `join.js` | Asking a hub to join, waiting for the answer and saving `device.json` |
 | `registry.js` | `nodes.json`: paired nodes, never the plaintext token |
 | `policy.js` | The read-only list and the argument rules |
 | `protocol.js` | Task kinds, path rules, size limits and the wire shape |
 | `select.js` | Choosing a machine from a hostname, machine name or path hint |
-| `hub.js` | HTTP endpoints, SSE streams, task queue, timeouts, session endpoints |
+| `hub.js` | HTTP endpoints, join requests, SSE streams, task queue, timeouts, session endpoints |
 | `worker.js` | Pairing, reconnect loop, execution, file reads and writes, result delivery |
 | `session-sync.js` | The center's revisioned snapshot and the one write path for a node message |
 | `session-client.js` | The node's pull loop, read replica and send that a worker follows |
 | `daemon.js` | launchd, systemd and Windows logon files, install and status |
-| `tools.js` | The seven Bot tools and the hub's lifecycle in the plugin |
+| `tools.js` | The seven Bot tools, the hub's lifecycle and this machine as a node |
 | `sse.js` | The event framing both sides share |
 | `cli.js` | `hub`, `code`, `nodes`, `run`, `worker`, `say` and `daemon` |
 
 Plain HTTP on a trusted LAN, the admin token equals local administrator, and approval
-is a gate on the tool, not a sandbox on the node. The hub listens on all interfaces by
-default; set `multiDevice.host` to `127.0.0.1` for local-only debugging.
+is a gate on the tool, not a sandbox on the node. A join request pairs nothing until the
+person at the hub presses Allow, and the page shows the machine's name, hostname and
+address first; discovery only answers "a hub is here", never a token. The hub listens on
+all interfaces by default and answers discovery on UDP 8789; set `multiDevice.host` to
+`127.0.0.1` for local-only debugging.

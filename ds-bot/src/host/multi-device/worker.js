@@ -19,11 +19,12 @@ const MAX_TIMEOUT_MS = 5 * 60_000
 const RESULT_TRIES = 3
 const HUB_TIMEOUT_MS = 30_000
 
-function deviceFile(dataDir) {
+export function deviceFile(dataDir) {
   return join(dataDir, 'device.json')
 }
 
-function readDevice(dataDir) {
+// The saved pairing, read by the worker and by the plugin that runs one on this machine.
+export function readDevice(dataDir) {
   try {
     const parsed = JSON.parse(readFileSync(deviceFile(dataDir), 'utf8'))
     if (typeof parsed?.token === 'string' && parsed.token !== '' && typeof parsed.nodeId === 'string') return parsed
@@ -33,7 +34,7 @@ function readDevice(dataDir) {
   return undefined
 }
 
-function writeDevice(dataDir, device) {
+export function writeDevice(dataDir, device) {
   mkdirSync(dataDir, { recursive: true })
   const path = deviceFile(dataDir)
   const temp = `${path}.${process.pid}.tmp`

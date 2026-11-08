@@ -3,10 +3,14 @@
 // tools runs inside the plugin process on the center machine; the worker stays a separate
 // process on the other machine (cli.js), so a Windows PC needs no DSH install.
 import { homedir, hostname as localHostname } from 'node:os'
+import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { output } from '../tools.js'
 import { createHub } from './hub.js'
+import { DISCOVERY_PORT, findHubs } from './discovery.js'
+import { joinHub } from './join.js'
+import { createWorker, deviceFile, readDevice } from './worker.js'
 import { daemonCommand } from './daemon.js'
 import { APPROVED_NOTE, classifyCommand, describePolicy } from './policy.js'
 import { MAX_FILE_BYTES, taskLabel } from './protocol.js'
@@ -35,6 +39,8 @@ export function multiDeviceOptions(config = {}) {
     port: Number.isInteger(options.port) ? options.port : DEFAULT_PORT,
     name: typeof options.name === 'string' && options.name !== '' ? options.name : localHostname(),
     requireApprovalForReads: options.requireApprovalForReads === true,
+    discoveryPort: Number.isInteger(options.discoveryPort) ? options.discoveryPort : DISCOVERY_PORT,
+    discovery: options.discovery !== false,
   }
 }
 
@@ -392,6 +398,16 @@ export function install(rt) {
   let hub
   let ready = Promise.resolve({ ok: false, error: 'multi-device is off on this computer' })
   let starting
+  // This machine as a node of another hub. It is a separate role from running the hub:
+  // a machine that joined a center keeps its worker here, reconnects on its own, and
+  // does not need the switch above.
+  let nodeWorker
+  let nodeError
+  let joining
+  let joinAbort
+  // The hub this computer joined from this page, kept in the team file so a restart
+  // comes back as the same node. A device.json alone belongs to a worker the CLI runs.
+  let nodeJoined
   // The conversation sync is created once, with the plugin runtime: the hub is the one
   // writer of the Session, and a node only ever reads snapshots of it.
   let sessionSync
@@ -401,10 +417,28 @@ export function install(rt) {
     rt.warn('ds-bot: LAN session sync is off: %s', error.message)
   }
 
+  const savedDevice = () => readDevice(options.dataDir)
+
+  const nodeStatus = () => {
+    const info = nodeWorker?.info()
+    return {
+      paired: nodeJoined !== undefined,
+      hubUrl: info?.hubUrl ?? nodeJoined?.hubUrl,
+      hubName: nodeJoined?.hubName,
+      nodeName: info?.nodeName ?? nodeJoined?.nodeName,
+      state: info?.status ?? (nodeJoined === undefined ? 'unpaired' : 'offline'),
+      online: info?.status === 'online',
+      error: info?.lastError ?? nodeError,
+      ...(joining === undefined ? {} : { joining: { ...joining } }),
+    }
+  }
+
   const status = () => ({
     available: profileOff !== true,
     configured: profileOn,
-    enabled,
+    // A machine that joined a hub is a node first; the switch is out of reach until it
+    // leaves, and the stored choice comes back then.
+    enabled: enabled && nodeJoined === undefined,
     hub: {
       state: phase,
       ...(failure === undefined ? {} : { error: failure }),
@@ -413,6 +447,10 @@ export function install(rt) {
       name: options.name,
     },
     nodes: hub === undefined ? [] : hub.nodes(),
+    // Machines that asked to join and wait for a yes or no on this page.
+    requests: hub === undefined ? [] : hub.joinRequests().filter(entry => entry.status === 'pending'),
+    // This computer as a node of another hub; independent of the switch above.
+    node: nodeStatus(),
     // How far the paired screens have been let into the one conversation: a revision a
     // node can compare, and how many polls are waiting for the next change.
     sync: sessionSync === undefined ? null : { ...sessionSync.status(), active: enabled && phase === 'listening' },
@@ -553,6 +591,134 @@ export function install(rt) {
     return status()
   }
 
+  // This machine as a node: the same worker the CLI runs, in the plugin process, so an
+  // installed copy joins from the page with no Node project and no terminal. It follows
+  // the center's conversation by default, and reconnects from device.json after a drop
+  // or a restart.
+  const startNode = () => {
+    if (nodeWorker !== undefined) return nodeWorker
+    if (nodeJoined === undefined) return undefined
+    const saved = savedDevice()
+    if (saved === undefined || typeof saved.hubUrl !== 'string') return undefined
+    nodeWorker = createWorker({
+      hubUrl: saved.hubUrl,
+      dataDir: options.dataDir,
+      name: saved.nodeName,
+      sync: 'main',
+      log: (message, ...args) => rt.warn(message, ...args),
+    })
+    nodeError = undefined
+    void nodeWorker.start().catch(error => { nodeError = error.message })
+    return nodeWorker
+  }
+
+  const stopNode = async () => {
+    const current = nodeWorker
+    nodeWorker = undefined
+    if (current !== undefined) await current.stop().catch(() => {})
+  }
+
+  const saveJoined = async (value) => {
+    await rt.load()
+    rt.state.multiDevice ??= {}
+    if (value === undefined) delete rt.state.multiDevice.node
+    else rt.state.multiDevice.node = value
+    await rt.save()
+  }
+
+  const requireHub = () => {
+    if (hub === undefined || phase !== 'listening') throw new Error('The hub is not listening on this computer.')
+    return hub
+  }
+
+  const scan = async ({ timeoutMs } = {}) => {
+    const hubs = await findHubs({
+      port: options.discoveryPort,
+      timeoutMs: Number.isInteger(timeoutMs) ? Math.min(Math.max(timeoutMs, 200), 10_000) : 1200,
+      ignore: hub === undefined ? [] : [hub.id],
+    })
+    return { hubs: hubs.map(entry => ({ id: entry.id, name: entry.name, url: entry.url, address: entry.address })) }
+  }
+
+  // Asking leaves the page free: the status poll carries `node.joining` until the hub
+  // answers, and then either the worker starts or `node.error` says why not.
+  const join = async (hubUrl) => {
+    if (joining?.state === 'waiting') throw new Error('This computer is already asking to join a hub.')
+    if (nodeJoined !== undefined) throw new Error('This computer already joined a hub. Leave it first.')
+    if (profileOff) throw new Error('Multi-device is turned off in this computer\'s profile configuration (multiDevice: false).')
+    const readOnly = rt.readOnly()
+    if (readOnly !== undefined) throw new Error(readOnly)
+    const url = String(hubUrl ?? '').trim().replace(/\/+$/, '')
+    if (!/^https?:\/\/[^/\s]+/.test(url)) throw new Error('Enter the hub address, such as http://192.168.1.23:8787.')
+    await rt.load()
+    nodeError = undefined
+    joinAbort = new AbortController()
+    joining = { state: 'waiting', url, startedAt: new Date().toISOString() }
+    void joinHub({
+      hubUrl: url,
+      dataDir: options.dataDir,
+      name: options.name,
+      signal: joinAbort.signal,
+      onWaiting: ({ hub: hubName }) => {
+        if (joining !== undefined && typeof hubName === 'string') joining.hub = hubName
+      },
+    }).then(async saved => {
+      nodeJoined = { hubUrl: saved.hubUrl, hubName: saved.hubName, nodeName: saved.nodeName }
+      joining = undefined
+      try {
+        await saveJoined(nodeJoined)
+      } catch (error) {
+        nodeError = `Joined ${saved.hubName ?? saved.hubUrl}, but the choice was not saved: ${error.message}`
+      }
+      // One center: this machine stops serving as a hub once it is a node, and the
+      // switch comes back when it leaves.
+      if (enabled) {
+        removeTools()
+        await stopHub()
+      }
+      startNode()
+    }, error => {
+      joining = undefined
+      nodeError = error.message
+    })
+    return status()
+  }
+
+  const leave = async () => {
+    const readOnly = rt.readOnly()
+    if (readOnly !== undefined) throw new Error(readOnly)
+    joinAbort?.abort()
+    joinAbort = undefined
+    joining = undefined
+    await stopNode()
+    nodeJoined = undefined
+    try {
+      unlinkSync(deviceFile(options.dataDir))
+    } catch {
+      // Already gone: the worker is stopped either way.
+    }
+    nodeError = undefined
+    await saveJoined(undefined)
+    if (enabled) {
+      addTools()
+      await startHub()
+    }
+    return status()
+  }
+
+  const approveJoin = async (requestId) => {
+    const readOnly = rt.readOnly()
+    if (readOnly !== undefined) throw new Error(readOnly)
+    await rt.load()
+    if (requireHub().approveJoin(String(requestId ?? '')) !== true) throw new Error('That request is no longer waiting.')
+    return status()
+  }
+
+  const denyJoin = async (requestId) => {
+    if (requireHub().denyJoin(String(requestId ?? '')) !== true) throw new Error('That request is no longer waiting.')
+    return status()
+  }
+
   Object.defineProperty(rt, 'multiDeviceEnabled', { get: () => enabled, configurable: true })
   Object.defineProperty(rt, 'multiDeviceError', { get: () => failure, configurable: true })
   Object.assign(rt, {
@@ -560,6 +726,11 @@ export function install(rt) {
     multiDeviceSetEnabled: setEnabled,
     multiDevicePairingCode: pairingCode,
     multiDeviceRemoveNode: removeNode,
+    multiDeviceScan: scan,
+    multiDeviceJoin: join,
+    multiDeviceLeave: leave,
+    multiDeviceApproveJoin: approveJoin,
+    multiDeviceDenyJoin: denyJoin,
     multiDeviceView: status,
   })
 
@@ -571,6 +742,13 @@ export function install(rt) {
     } catch (error) {
       rt.warn('ds-bot: the LAN multi-device switch could not be read: %s', error.message)
     }
+    // A machine that joined a hub earlier reconnects whether or not this one is also a
+    // hub and whether or not multi-device was ever turned on here.
+    const joined = rt.state?.multiDevice?.node
+    nodeJoined = joined !== null && typeof joined === 'object' && typeof joined.hubUrl === 'string' ? joined : undefined
+    startNode()
+    // A node does not serve a second center, whatever the stored switch says.
+    if (nodeJoined !== undefined) return
     if (profileOff) return
     const stored = rt.state?.multiDevice?.enabled
     enabled = typeof stored === 'boolean' ? stored : profileOn
@@ -580,5 +758,9 @@ export function install(rt) {
   })()
   rt.multiDeviceReady = boot.then(() => ready)
 
-  ctx.effect(() => () => { void stopHub() }, 'ds-bot: LAN multi-device hub')
+  ctx.effect(() => () => {
+    joinAbort?.abort()
+    void stopNode()
+    void stopHub()
+  }, 'ds-bot: LAN multi-device hub')
 }

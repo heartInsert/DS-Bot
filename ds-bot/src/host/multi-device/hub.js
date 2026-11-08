@@ -8,8 +8,9 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import { createCodeStore, newToken } from './pairing.js'
+import { startResponder, DISCOVERY_PORT } from './discovery.js'
 import { MAX_FILE_BYTES, normalizeTaskSpec, wireTask } from './protocol.js'
-import { createRegistry } from './registry.js'
+import { createRegistry, nodeName } from './registry.js'
 import { writeEvent, writePing } from './sse.js'
 
 export const PROTOCOL = 2
@@ -25,6 +26,13 @@ const TASK_GRACE_MS = 5_000
 const MAX_TASKS = 500
 const PAIR_WINDOW_MS = 5 * 60_000
 const PAIR_TRIES = 10
+const JOIN_TTL_MS = 5 * 60_000
+// An answered request keeps its token only this long, so the hub's memory does not hold
+// a usable device token after the machine that asked is long gone.
+const JOIN_KEEP_MS = 2 * 60_000
+const MAX_JOIN_REQUESTS = 8
+const MAX_JOIN_PER_ADDRESS = 3
+const JOIN_WAIT_MAX_MS = 20_000
 
 const TERMINAL = new Set(['done', 'failed', 'rejected', 'timeout', 'cancelled'])
 const terminal = state => TERMINAL.has(state)
@@ -114,7 +122,7 @@ function adminToken(dataDir) {
   return { token, file, created: true }
 }
 
-export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS Bot hub', sessionSync, log = () => {}, now = Date.now } = {}) {
+export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS Bot hub', sessionSync, discovery = true, discoveryPort = DISCOVERY_PORT, log = () => {}, now = Date.now } = {}) {
   if (typeof dataDir !== 'string' || dataDir === '') throw new Error('createHub needs a dataDir')
   mkdirSync(dataDir, { recursive: true })
   const registry = createRegistry({ dataDir, now, log })
@@ -126,6 +134,12 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
   const waiters = new Map()
   const streams = new Map()
   const pairFailures = new Map()
+  const joins = new Map()
+  const joinWaiters = new Map()
+  // The identity a discovery answer carries. It is made per hub run, so a machine that
+  // restarted is a different hub to a page that is still looking.
+  const id = `hub_${randomBytes(6).toString('base64url')}`
+  let responder
 
   let server
   let boundPort = port
@@ -144,6 +158,67 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
         ? undefined
         : { ...task.result, ...(task.result.file === undefined ? {} : { file: { ...task.result.file } }) },
     }
+  }
+
+  function addNode(device) {
+    const token = newToken()
+    const node = registry.add({
+      name: device.name,
+      token,
+      os: device.os,
+      platform: device.platform,
+      arch: device.arch,
+      hostname: device.hostname,
+      agentVersion: device.agentVersion,
+    })
+    return { node, token }
+  }
+
+  // A join request is what the person at the hub sees before anything is paired: the
+  // machine's name, what it runs and where it came from. The token is not in this shape.
+  function joinPublic(request) {
+    return {
+      id: request.id,
+      name: request.name,
+      hostname: request.hostname,
+      os: request.os,
+      arch: request.arch,
+      address: request.address,
+      createdAt: request.createdAt,
+      expiresAt: request.expiresAt,
+      status: request.status,
+    }
+  }
+
+  function notifyJoin(id) {
+    const set = joinWaiters.get(id)
+    if (set === undefined) return
+    joinWaiters.delete(id)
+    for (const resolve of set) resolve()
+  }
+
+  function pruneJoins() {
+    const at = now()
+    for (const request of joins.values()) {
+      if (request.status === 'pending' && at >= request.expiresAtMs) request.status = 'expired'
+      if (request.status !== 'pending' && at - request.createdAtMs > JOIN_KEEP_MS) joins.delete(request.id)
+    }
+  }
+
+  function waitJoin(request, waitMs) {
+    if (request.status !== 'pending' || !(waitMs > 0)) return Promise.resolve()
+    return new Promise(resolve => {
+      const set = joinWaiters.get(request.id) ?? new Set()
+      joinWaiters.set(request.id, set)
+      const done = () => {
+        clearTimeout(timer)
+        set.delete(done)
+        resolve()
+      }
+      const timer = setTimeout(done, waitMs)
+      timer.unref?.()
+      set.add(done)
+    })
   }
 
   function settle(task, patch) {
@@ -253,19 +328,79 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       return send(response, 403, { error: 'pairing code is invalid or expired' })
     }
     const device = body.device && typeof body.device === 'object' ? body.device : {}
-    const token = newToken()
-    const node = registry.add({
-      name: device.name,
-      token,
-      os: device.os,
-      platform: device.platform,
-      arch: device.arch,
-      hostname: device.hostname,
-      agentVersion: device.agentVersion,
-    })
+    const { node, token } = addNode(device)
     log('ds-bot lan: paired %s as %s', node.name, node.id)
     events.emit('paired', publicNode(node))
     send(response, 200, { protocol: PROTOCOL, hub: name, nodeId: node.id, nodeName: node.name, token })
+  }
+
+  // Looking for the hub, and asking to be let in. The request is free to make and pairs
+  // nothing: the node exists only after approveJoin, so the person at the hub is the one
+  // who decides, and the machine that asked never learns whether a token exists until
+  // then.
+  async function handleJoinRequest(request, response) {
+    pruneJoins()
+    const body = await readJson(request)
+    const known = typeof body.requestId === 'string' ? joins.get(body.requestId) : undefined
+    if (known !== undefined) {
+      return send(response, 200, {
+        ...joinPublic(known),
+        requestId: known.id,
+        hub: name,
+        ...(known.status === 'approved' ? { token: known.token, nodeId: known.nodeId, nodeName: known.nodeName } : {}),
+      })
+    }
+    const device = body.device && typeof body.device === 'object' ? body.device : {}
+    const address = String(request.socket.remoteAddress ?? 'unknown').replace(/^::ffff:/i, '')
+    const pending = [...joins.values()].filter(entry => entry.status === 'pending')
+    // A page that asks twice, or asks again after a lost answer, means the same machine:
+    // it gets the request that is already waiting instead of a second row on the hub.
+    const repeated = pending.find(entry => entry.address === address && (entry.hostname ?? '') === String(device.hostname ?? ''))
+    if (repeated !== undefined) {
+      return send(response, 200, { ...joinPublic(repeated), requestId: repeated.id, hub: name })
+    }
+    if (pending.length >= MAX_JOIN_REQUESTS) {
+      return send(response, 429, { error: 'too many machines are waiting to join; allow or deny them on the hub first' })
+    }
+    if (pending.filter(entry => entry.address === address).length >= MAX_JOIN_PER_ADDRESS) {
+      return send(response, 429, { error: 'this machine already asked to join; wait for the answer on the hub' })
+    }
+    const createdAtMs = now()
+    const entry = {
+      id: `jr_${randomBytes(9).toString('base64url')}`,
+      name: typeof device.name === 'string' && device.name.trim() !== '' ? device.name.trim().slice(0, 40) : nodeName('device'),
+      hostname: typeof device.hostname === 'string' ? device.hostname.slice(0, 120) : undefined,
+      os: typeof device.os === 'string' ? device.os.slice(0, 40) : undefined,
+      arch: typeof device.arch === 'string' ? device.arch.slice(0, 40) : undefined,
+      address,
+      device,
+      status: 'pending',
+      createdAt: new Date(createdAtMs).toISOString(),
+      createdAtMs,
+      expiresAt: new Date(createdAtMs + JOIN_TTL_MS).toISOString(),
+      expiresAtMs: createdAtMs + JOIN_TTL_MS,
+    }
+    joins.set(entry.id, entry)
+    log('ds-bot lan: %s asked to join from %s', entry.name, address)
+    events.emit('join', joinPublic(entry))
+    return send(response, 200, { ...joinPublic(entry), requestId: entry.id, hub: name })
+  }
+
+  async function handleJoinStatus(request, response, requestId, query) {
+    pruneJoins()
+    const entry = joins.get(requestId)
+    if (entry === undefined) return send(response, 404, { error: 'no such join request' })
+    const wait = Number(query.get('wait'))
+    await waitJoin(entry, Number.isFinite(wait) ? Math.min(Math.max(wait, 0), JOIN_WAIT_MAX_MS) : 0)
+    // A waiting poll may outlive its socket when the page closes; writing to it would
+    // only raise an error nobody reads.
+    if (response.writableEnded || response.destroyed) return undefined
+    return send(response, 200, {
+      ...joinPublic(entry),
+      requestId: entry.id,
+      hub: name,
+      ...(entry.status === 'approved' ? { token: entry.token, nodeId: entry.nodeId, nodeName: entry.nodeName } : {}),
+    })
   }
 
   async function handleResult(request, response) {
@@ -354,6 +489,18 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     if (request.method === 'GET' && path === '/admin/nodes') {
       return send(response, 200, { nodes: registry.list().map(publicNode), count: streams.size })
     }
+    if (request.method === 'GET' && path === '/admin/join-requests') {
+      return send(response, 200, { requests: joinRequests() })
+    }
+    const joinMatch = /^\/admin\/join-requests\/([^/]+)$/.exec(path)
+    if (request.method === 'POST' && joinMatch !== null) {
+      const requestId = decodeURIComponent(joinMatch[1])
+      const body = await readJson(request)
+      const allowed = body.action !== 'deny'
+      const done = allowed ? approveJoin(requestId) : denyJoin(requestId)
+      if (!done) return send(response, 404, { error: 'no join request with that id is waiting' })
+      return send(response, 200, { ok: true, requests: joinRequests() })
+    }
     // A removed node loses its token now; it has to pair again before it can be used.
     const removeMatch = /^\/admin\/nodes\/([^/]+)$/.exec(path)
     if (request.method === 'DELETE' && removeMatch !== null) {
@@ -380,9 +527,12 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     const target = new URL(request.url ?? '/', 'http://hub')
     const path = target.pathname
     if (request.method === 'GET' && path === '/health') {
-      return send(response, 200, { ok: true, hub: name, version: VERSION, protocol: PROTOCOL, nodes: registry.list().length, session: sessionSync !== undefined })
+      return send(response, 200, { ok: true, hub: name, id, version: VERSION, protocol: PROTOCOL, nodes: registry.list().length, session: sessionSync !== undefined })
     }
     if (request.method === 'POST' && path === '/pair') return handlePair(request, response)
+    if (request.method === 'POST' && path === '/join') return handleJoinRequest(request, response)
+    const joinStatus = /^\/join\/([A-Za-z0-9_-]+)$/.exec(path)
+    if (request.method === 'GET' && joinStatus !== null) return handleJoinStatus(request, response, joinStatus[1], target.searchParams)
     if (request.method === 'GET' && path === '/stream') return handleStream(request, response)
     if (request.method === 'POST' && path === '/heartbeat') {
       const node = registry.findByToken(bearer(request))
@@ -440,6 +590,37 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     return registry.remove(node.id)
   }
 
+  // What the Devices page lists and what the two buttons act on. A request that was
+  // answered stays visible for a while so the page can show what happened, then goes.
+  function joinRequests() {
+    pruneJoins()
+    return [...joins.values()]
+      .sort((left, right) => left.createdAtMs - right.createdAtMs)
+      .map(joinPublic)
+  }
+
+  function approveJoin(reference) {
+    pruneJoins()
+    const request = joins.get(String(reference ?? ''))
+    if (request === undefined || request.status !== 'pending') return false
+    const { node, token } = addNode(request.device)
+    Object.assign(request, { status: 'approved', token, nodeId: node.id, nodeName: node.name })
+    log('ds-bot lan: allowed %s to join as %s', request.name, node.name)
+    events.emit('paired', publicNode(node))
+    notifyJoin(request.id)
+    return true
+  }
+
+  function denyJoin(reference) {
+    pruneJoins()
+    const request = joins.get(String(reference ?? ''))
+    if (request === undefined || request.status !== 'pending') return false
+    request.status = 'denied'
+    log('ds-bot lan: denied a join request from %s', request.name)
+    notifyJoin(request.id)
+    return true
+  }
+
   function waitForTask(id, { timeoutMs = 60_000 } = {}) {
     const task = tasks.get(id)
     if (task === undefined) return Promise.reject(new Error(`no such task: ${id}`))
@@ -464,8 +645,14 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     get url() {
       return url
     },
+    get id() {
+      return id
+    },
     get port() {
       return boundPort
+    },
+    get discoveryPort() {
+      return responder?.port
     },
     get dataDir() {
       return dataDir
@@ -481,6 +668,9 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
     nodes: () => registry.list().map(publicNode),
     isOnline: nodeId => streams.has(nodeId),
     issueCode: () => codes.issue(),
+    joinRequests,
+    approveJoin,
+    denyJoin,
     dispatch,
     removeNode,
     task: id => (tasks.has(id) ? publicTask(tasks.get(id)) : undefined),
@@ -508,11 +698,24 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       if (address !== null && typeof address === 'object') boundPort = address.port
       const display = host === '0.0.0.0' || host === '::' ? lanAddress() : host
       url = `http://${display}:${boundPort}`
+      // Discovery is best effort: a machine with the UDP port taken or a firewall that
+      // drops the probe still serves the hub, and the Devices page falls back to the
+      // pairing code.
+      if (discovery !== false) {
+        responder = startResponder({
+          port: discoveryPort,
+          identity: () => ({ name, port: boundPort, id, protocol: PROTOCOL }),
+          log,
+        })
+        await responder.ready.catch(() => {})
+      }
       return { url, port: boundPort }
     },
     async stop() {
       if (stopped) return
       stopped = true
+      await responder?.close()
+      responder = undefined
       for (const nodeId of streams.keys()) dropStream(nodeId)
       for (const timer of taskTimers.values()) clearTimeout(timer)
       taskTimers.clear()

@@ -655,6 +655,18 @@ export function install(rt) {
           return ok(rt.multiDevicePairingCode())
         case 'multi-device-remove':
           return ok(await rt.multiDeviceRemoveNode(String(body.node ?? '')))
+        // Finding a hub on the network and asking to join it: the page does this with
+        // buttons, so the endpoint is a small wrapper around the same calls.
+        case 'multi-device-scan':
+          return ok(await rt.multiDeviceScan(body))
+        case 'multi-device-join':
+          return ok(await rt.multiDeviceJoin(String(body.hub ?? body.url ?? '')))
+        case 'multi-device-leave':
+          return ok(await rt.multiDeviceLeave())
+        case 'multi-device-approve':
+          return ok(await rt.multiDeviceApproveJoin(String(body.request ?? '')))
+        case 'multi-device-deny':
+          return ok(await rt.multiDeviceDenyJoin(String(body.request ?? '')))
         case 'diagnostics':
           await rt.load()
           return ok(await rt.diagnostics.report(body))
