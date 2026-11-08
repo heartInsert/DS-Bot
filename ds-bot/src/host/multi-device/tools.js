@@ -42,6 +42,9 @@ export function multiDeviceOptions(config = {}) {
     requireApprovalForReads: options.requireApprovalForReads === true,
     discoveryPort: Number.isInteger(options.discoveryPort) ? options.discoveryPort : DISCOVERY_PORT,
     discovery: options.discovery !== false,
+    // How often a joined node re-reads the hub's team, so a Bot or a group chat created,
+    // renamed or deleted there reaches this machine without a restart.
+    teamPollMs: Number.isInteger(options.teamPollMs) ? Math.max(500, options.teamPollMs) : 10_000,
   }
 }
 
@@ -413,6 +416,8 @@ export function install(rt) {
   // Both are shown by the Devices page so the user can find the copy if they want it back.
   let lastBackup
   let lastSync
+  // The periodic re-read of the hub's team while joined, so list changes propagate.
+  let teamTimer
   // The conversation sync is created once, with the plugin runtime: the hub is the one
   // writer of the Session, and a node only ever reads snapshots of it.
   let sessionSync
@@ -619,10 +624,20 @@ export function install(rt) {
     })
     nodeError = undefined
     void nodeWorker.start().catch(error => { nodeError = error.message })
+    // The join took the hub's team once; after that the hub keeps owning it, so this
+    // machine re-reads it on a timer and applies a changed list (created, renamed,
+    // deleted) without a restart. The marker makes a no-op re-read write nothing.
+    clearInterval(teamTimer)
+    teamTimer = setInterval(() => {
+      void refreshTeam().catch(() => {})
+    }, options.teamPollMs)
+    teamTimer.unref?.()
     return nodeWorker
   }
 
   const stopNode = async () => {
+    clearInterval(teamTimer)
+    teamTimer = undefined
     const current = nodeWorker
     nodeWorker = undefined
     if (current !== undefined) await current.stop().catch(() => {})

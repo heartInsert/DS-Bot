@@ -538,13 +538,16 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       return send(response, 503, { error: 'this hub does not serve a conversation; it runs without the Bot team' })
     }
     registry.touch(node.id)
-    if (request.method === 'GET' && path === '/session/bots') {
+    if (request.method === 'GET' && (path === '/session/bots' || path === '/session/list')) {
       return send(response, 200, await sessionSync.bots())
     }
     if (request.method === 'GET' && path === '/session') {
       const since = Number(query.get('since'))
       const wait = Number(query.get('wait'))
-      const snapshot = await sessionSync.snapshot(String(query.get('bot') ?? ''), {
+      // A conversation is a Bot's own chat (`bot=`) or a group chat (`room=`).
+      const room = query.get('room')
+      const reference = room !== null && room !== '' ? `room:${room}` : `bot:${query.get('bot') ?? ''}`
+      const snapshot = await sessionSync.snapshot(reference, {
         since: Number.isFinite(since) ? since : undefined,
         epoch: query.get('epoch') ?? undefined,
         waitMs: Number.isFinite(wait) ? wait : undefined,
@@ -558,6 +561,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       const body = await readJson(request)
       const result = await sessionSync.send({
         botId: body.botId,
+        roomId: body.roomId,
         text: body.text,
         messageId: body.messageId,
       })
@@ -644,7 +648,7 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       return send(response, 200, { ok: true, time: new Date(now()).toISOString() })
     }
     if (request.method === 'POST' && path === '/result') return handleResult(request, response)
-    if (path === '/session' || path === '/session/bots') return handleSession(request, response, path, target.searchParams)
+    if (path === '/session' || path === '/session/bots' || path === '/session/list') return handleSession(request, response, path, target.searchParams)
     if (path === '/team') return handleTeam(request, response)
     if (path.startsWith('/admin/')) return handleAdmin(request, response, path)
     return send(response, 404, { error: 'not found' })

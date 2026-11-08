@@ -1574,6 +1574,18 @@ export function install(rt) {
     return { sessionId: parts.at(-1).sessionId, ...(await partPage(parts, index, cursor)) }
   }
 
+  // A group chat's own conversation, the same shape as a Bot's own chat. The group's
+  // own Session runs no model; its posts and relays read the way `chatPage` reads a Bot.
+  async function roomPage(roomId, cursor) {
+    const room = rt.roomOf(roomId)
+    if (room === undefined) throw Object.assign(new Error('Unknown room'), { code: 'bot/not-found' })
+    const parts = partsOf(undefined, roomId)
+    if (parts.length === 0) throw Object.assign(new Error('Unknown room'), { code: 'bot/not-found' })
+    const index = Number.isInteger(cursor?.part) ? cursor.part : parts.length - 1
+    if (index < 0 || index >= parts.length) return { sessionId: parts.at(-1).sessionId, items: [], cursor: null }
+    return { sessionId: parts.at(-1).sessionId, ...(await partPage(parts, index, cursor)) }
+  }
+
   // "New session" in a Bot's chat: a manual move to a fresh part with the
   // deterministic handoff package, no model call.
   async function newPart(sessionId) {
@@ -1628,5 +1640,5 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { clock, partsOf, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, followFolder, heldBack, newPart, switchPart, switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, historyEntry, partLines, noteText, earlierPage, chatPage, roomPage, displayItems, followFolder, heldBack, newPart, switchPart, switchJobs: () => switches.values() })
 }
