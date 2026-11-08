@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import { createRuntime } from '../index.js'
 import { createHub } from '../src/host/multi-device/hub.js'
 import { createTeamWrite, TEAM_WRITE_LOG_FILE } from '../src/host/multi-device/team-write.js'
-import { createTeamSource, readUnsyncedLocalTeam, recordUnsyncedLocalTeam, unsyncedLocalPath, unsyncedLocalTeam } from '../src/host/multi-device/team-sync.js'
+import { createTeamSource, readUnsyncedLocalTeam, recordUnsyncedLocalTeam, removeUnsyncedLocalTeam, unsyncedLocalPath, unsyncedLocalTeam, UNSYNCED_PRE_JOIN } from '../src/host/multi-device/team-sync.js'
 import { fakeContext } from './fake-ctx.js'
 
 const folder = name => mkdtempSync(join(tmpdir(), `dsb-twrite-${name}-`))
@@ -163,27 +163,47 @@ test('rename and delete forward through the same apply', async () => {
 
 // The unsynced local team: the local Bots and groups the hub's bundle does not name are
 // recorded in the node data dir before a take-over, so nothing is dropped silently.
-test('unsynced local Bots and groups are detected and recorded', () => {
+test('unsynced local Bots and groups are detected and recorded, merged not cleared', () => {
   const dataDir = folder('unsynced')
   const local = { bots: { a: { id: 'a' }, z: { id: 'z' } }, rooms: { r1: { id: 'r1' }, r9: { id: 'r9' } } }
   const hub = { bots: { a: { id: 'a' } }, rooms: { r1: { id: 'r1' } } }
   const found = unsyncedLocalTeam(local, hub)
   assert.deepEqual(found.bots.map(bot => bot.id), ['z'])
   assert.deepEqual(found.rooms.map(room => room.id), ['r9'])
-  const recorded = recordUnsyncedLocalTeam(dataDir, found)
+  const recorded = recordUnsyncedLocalTeam(dataDir, {
+    bots: found.bots.map(bot => ({ ...bot, origin: UNSYNCED_PRE_JOIN })),
+    rooms: found.rooms.map(room => ({ ...room, origin: UNSYNCED_PRE_JOIN })),
+  })
   assert.equal(recorded.bots.length, 1)
   assert.equal(recorded.rooms.length, 1)
   assert.equal(readUnsyncedLocalTeam(dataDir).bots[0].id, 'z')
   assert.equal(readUnsyncedLocalTeam(dataDir).rooms[0].id, 'r9')
-  // A take-over with nothing unsynced clears the record.
-  recordUnsyncedLocalTeam(dataDir, unsyncedLocalTeam(local, local))
-  assert.equal(existsSync(unsyncedLocalPath(dataDir)), false)
+  // A later take-over with nothing unsynced keeps the earlier record instead of clearing it.
+  recordUnsyncedLocalTeam(dataDir, { bots: [], rooms: [] })
+  assert.equal(existsSync(unsyncedLocalPath(dataDir)), true)
+  assert.equal(readUnsyncedLocalTeam(dataDir).bots[0].id, 'z')
+  assert.equal(readUnsyncedLocalTeam(dataDir).rooms[0].id, 'r9')
+  // Only the hub accepting a migration removes an entry, and it stores the hub's id.
+  removeUnsyncedLocalTeam(dataDir, { bots: ['z'], migratedBots: { z: 'hub-z' } })
+  assert.deepEqual(readUnsyncedLocalTeam(dataDir).bots, [])
+  assert.equal(readUnsyncedLocalTeam(dataDir).migratedBots.z, 'hub-z')
+  assert.equal(readUnsyncedLocalTeam(dataDir).rooms[0].id, 'r9')
+})
+
+test('a Bot the hub deleted since the last apply is not node-local and is not recorded', () => {
+  // The node holds the previously applied team (a and z); the hub then dropped z.
+  const local = { bots: { a: { id: 'a' }, z: { id: 'z' } }, rooms: {} }
+  const hub = { bots: { a: { id: 'a' } }, rooms: {} }
+  const found = unsyncedLocalTeam(local, hub, { appliedBotIds: ['a', 'z'] })
+  assert.deepEqual(found.bots, [], 'z came from the hub, so it is not node-local')
+  assert.deepEqual(found.rooms, [])
+  // Without the applied set (a first join) the same diff is node-local.
+  assert.deepEqual(unsyncedLocalTeam(local, hub).bots.map(bot => bot.id), ['z'])
 })
 
 // The full path: a node forwards a create to the hub through its device token, the hub
 // applies it, and a second node pulls the new Bot without a restart.
 async function joinedPair(t) {
-  const discoveryPort = await freeUdpPort()
   const hubHome = folder('hub-home')
   const state = hubState()
   mkdirSync(hubHome, { recursive: true })
@@ -284,53 +304,155 @@ test('a node not joined to a hub refuses a team write', async () => {
   }
 })
 
-// A local Bot the hub does not know is kept (backup + record) and submitted to the hub
-// as a create once the node is connected, instead of being dropped silently.
-test('a local Bot the hub does not know is recorded and migrated on join', async t => {
-  const discoveryPort = await freeUdpPort()
-  const hubHome = folder('mig-hub-home')
-  const state = hubState()
-  mkdirSync(hubHome, { recursive: true })
-  writeFileSync(join(hubHome, 'state.json'), `${JSON.stringify(state, null, 2)}\n`)
-  const hubData = folder('mig-hub-data')
-  const hubRt = stubHubRt(state, hubHome)
-  const session = {
-    async bots() { return { epoch: 'e1', revision: state.revision, bots: Object.values(state.bots).map(bot => ({ id: bot.id, name: bot.name, role: bot.role, main: state.mainBotIds.includes(bot.id) })), rooms: Object.values(state.rooms).map(room => ({ id: room.id, name: room.name })) } },
+// A hub that accepts team writes, with a live `state` object and its rt stand-in.
+function writeHubSession(state) {
+  return {
+    async bots() {
+      return {
+        epoch: 'e1', revision: state.revision,
+        bots: Object.values(state.bots).map(bot => ({ id: bot.id, name: bot.name, role: bot.role, main: state.mainBotIds.includes(bot.id) })),
+        rooms: Object.values(state.rooms).map(room => ({ id: room.id, name: room.name })),
+      }
+    },
     async snapshot() { return { epoch: 'e1', revision: 1, botId: 'chief', botName: 'Chief', sessionId: 's1', items: [], hidden: 0 } },
     async send() { return { ok: true, revision: 1 } },
     async earlier() { return { items: [], cursor: null } },
     wakeTeam() {},
   }
+}
+
+async function startWriteHub(t, state) {
+  const hubHome = folder('write-hub-home')
+  mkdirSync(hubHome, { recursive: true })
+  writeFileSync(join(hubHome, 'state.json'), `${JSON.stringify(state, null, 2)}\n`)
+  const hubData = folder('write-hub-data')
+  const hubRt = stubHubRt(state, hubHome)
   const hub = createHub({
     dataDir: hubData, host: '127.0.0.1', port: 0, discovery: false, name: 'office-hub',
-    sessionSync: session,
+    sessionSync: writeHubSession(state),
     teamSync: createTeamSource({ state: () => state, home: () => hubHome, name: 'office-hub' }),
     teamWrite: createTeamWrite({ rt: hubRt, dataDir: hubData, log: () => {} }),
     log: () => {},
   })
   await hub.start()
   t.after(() => hub.stop())
+  return { hub, state, hubRt }
+}
 
-  const nodeHome = folder('mig-node-home')
-  const nodeData = folder('mig-node-data')
-  mkdirSync(nodeHome, { recursive: true })
-  writeFileSync(join(nodeHome, 'state.json'), `${JSON.stringify({
-    version: 1, mainBotIds: ['localonly'],
-    bots: { localonly: { id: 'localonly', name: 'LocalOnly', role: 'Here', sessionId: 'localonly', createdAt: 1 } },
-    rooms: {}, agents: {}, privateArchives: [], capabilities: { items: {} }, prefs: { theme: 'light' }, revision: 1,
-  }, null, 2)}\n`)
-  const nodeCtx = fakeContext()
-  const node = createRuntime(nodeCtx, { home: nodeHome, multiDevice: { host: '127.0.0.1', port: 0, dataDir: nodeData, name: 'node-c', discoveryPort, discovery: false } })
-  t.after(async () => { await node.multiDeviceHub?.stop(); await nodeCtx.dispose() })
-  await node.multiDeviceReady
+function nodeHomeState(extra = {}) {
+  return { version: 1, mainBotIds: [], bots: {}, rooms: {}, agents: {}, privateArchives: [], capabilities: { items: {} }, prefs: {}, revision: 1, ...extra }
+}
 
-  await node.multiDeviceJoin(hub.url)
-  const req = await until(() => hub.joinRequests()[0], { what: 'the join request' })
+// A node seeded with `homeState`, joined to the hub and left with the hub's team applied.
+async function makeJoinedNode(t, hub, state, name, homeState) {
+  const home = folder(`node-${name}-home`)
+  mkdirSync(home, { recursive: true })
+  writeFileSync(join(home, 'state.json'), `${JSON.stringify(homeState ?? nodeHomeState(), null, 2)}\n`)
+  const ctx = fakeContext()
+  const dataDir = folder(`node-${name}-data`)
+  const rt = createRuntime(ctx, { home, multiDevice: { host: '127.0.0.1', port: 0, dataDir, name, discoveryPort: await freeUdpPort(), discovery: false } })
+  await rt.multiDeviceReady
+  t.after(async () => { await rt.multiDeviceHub?.stop(); await ctx.dispose() })
+  await rt.multiDeviceJoin(hub.url)
+  const req = await until(() => hub.joinRequests().find(entry => entry.name === name), { what: `${name} join request` })
   hub.approveJoin(req.id)
-  await until(() => node.multiDeviceStatus().node.online, { what: 'the node to come online' })
+  await until(() => rt.multiDeviceStatus().node.online, { what: `${name} online` })
+  await until(() => Object.keys(readState(home).bots ?? {}).length === Object.keys(state.bots ?? {}).length, { what: `${name} team applied` })
+  return { rt, ctx, home, dataDir }
+}
 
-  // The hub now holds the migrated Bot (under a fresh stable id), and the node's record
-  // is cleared once it landed.
-  await until(() => Object.values(state.bots).some(bot => bot.name === 'LocalOnly'), { what: 'the local Bot to reach the hub' })
-  await until(() => readUnsyncedLocalTeam(nodeData) === undefined, { what: 'the unsynced record to clear' })
+// The pre-join team this machine held before its first take-over is kept (backup + record)
+// and shown read-only, but never submitted to the hub on its own.
+test('the pre-join team is preserved and shown, never auto-migrated', async t => {
+  const state = hubState()
+  const { hub } = await startWriteHub(t, state)
+  const node = await makeJoinedNode(t, hub, state, 'node-pre', nodeHomeState({
+    mainBotIds: ['localonly'],
+    bots: { localonly: { id: 'localonly', name: 'LocalOnly', role: 'Here', sessionId: 'localonly', createdAt: 1 } },
+    prefs: { theme: 'light' },
+  }))
+
+  const recorded = readUnsyncedLocalTeam(node.dataDir)
+  assert.equal(recorded.bots.length, 1)
+  assert.equal(recorded.bots[0].id, 'localonly')
+  assert.equal(recorded.bots[0].origin, UNSYNCED_PRE_JOIN)
+  assert.equal(Object.values(state.bots).some(bot => bot.name === 'LocalOnly'), false, 'pre-join entries are not auto-migrated')
+  assert.equal(readState(node.home).bots.localonly, undefined, 'the node took over the hub team')
+  // The Devices view reads them, with nothing pending.
+  const view = node.rt.multiDeviceStatus().node.unsynced
+  assert.deepEqual(view.preJoin, [{ kind: 'bot', id: 'localonly', name: 'LocalOnly' }])
+  assert.equal(view.pending, 0)
+})
+
+// A Bot made on the node after a previous apply (an older build writing locally) is the
+// one that migrates, and it lands on the hub once.
+test('a Bot made on the node after a previous apply is migrated to the hub', async t => {
+  const state = hubState()
+  const { hub } = await startWriteHub(t, state)
+  const node = await makeJoinedNode(t, hub, state, 'node-after', nodeHomeState())
+
+  // Simulate an older build writing locally: the Bot is in the node's state, not the hub's.
+  node.rt.state.bots.late = { id: 'late', name: 'LateMade', role: 'Look', sessionId: 'late', createdAt: 9 }
+  node.rt.state.mainBotIds = [...(node.rt.state.mainBotIds ?? []), 'late']
+  await node.rt.save()
+
+  await node.rt.multiDeviceRefreshTeam()
+  await until(() => Object.values(state.bots).some(bot => bot.name === 'LateMade'), { what: 'the node-local Bot to reach the hub' })
+
+  const migrated = Object.values(state.bots).find(bot => bot.name === 'LateMade')
+  assert.equal(Object.values(state.bots).filter(bot => bot.name === 'LateMade').length, 1)
+  // The pending entry left the record and the hub's resulting id is stored for rooms.
+  const recorded = readUnsyncedLocalTeam(node.dataDir)
+  assert.equal(recorded.bots.some(entry => entry.id === 'late'), false)
+  assert.equal(recorded.migratedBots.late, migrated.id)
+})
+
+// A hub-side delete of a Bot must not be undone by any node re-reading the team.
+test('a hub-side delete of a Bot is not undone by any node', async t => {
+  const state = hubState()
+  const { hub, hubRt } = await startWriteHub(t, state)
+  const nodeA = await makeJoinedNode(t, hub, state, 'node-a', nodeHomeState())
+  const nodeB = await makeJoinedNode(t, hub, state, 'node-b', nodeHomeState())
+
+  await hubRt.deleteBot('writer')
+
+  await nodeA.rt.multiDeviceRefreshTeam()
+  await nodeB.rt.multiDeviceRefreshTeam()
+  await until(() => readState(nodeA.home).bots.writer === undefined, { what: 'node-a to drop the deleted Bot' })
+  await until(() => readState(nodeB.home).bots.writer === undefined, { what: 'node-b to drop the deleted Bot' })
+
+  assert.equal(state.bots.writer, undefined, 'the hub delete holds')
+  assert.equal(Object.values(state.bots).some(bot => bot.name === 'Writer'), false)
+  for (const dir of [nodeA.dataDir, nodeB.dataDir]) {
+    const record = readUnsyncedLocalTeam(dir)
+    assert.equal(record === undefined || record.bots.every(entry => entry.id !== 'writer'), true, 'the deleted Bot is not recorded as node-local')
+  }
+})
+
+// A node-local room's members are node-local Bot ids; they map through the migrated Bots'
+// hub ids, and the room is created only once every member resolves.
+test('a node-local room migrates with its members mapped to hub ids, Bots first', async t => {
+  const state = hubState()
+  const { hub } = await startWriteHub(t, state)
+  const node = await makeJoinedNode(t, hub, state, 'node-room', nodeHomeState())
+
+  node.rt.state.bots.x1 = { id: 'x1', name: 'Alpha', role: 'Look', sessionId: 'x1', createdAt: 10 }
+  node.rt.state.bots.x2 = { id: 'x2', name: 'Beta', role: 'Look', sessionId: 'x2', createdAt: 11 }
+  node.rt.state.rooms.rlocal = { id: 'rlocal', name: 'Pair', members: ['x1', 'x2'], mode: 'admin', admin: 'x1', named: true }
+  await node.rt.save()
+
+  await node.rt.multiDeviceRefreshTeam()
+  await until(() => Object.values(state.rooms).some(room => room.name === 'Pair'), { what: 'the node-local room to reach the hub' })
+
+  const room = Object.values(state.rooms).find(entry => entry.name === 'Pair')
+  const alpha = Object.values(state.bots).find(bot => bot.name === 'Alpha')
+  const beta = Object.values(state.bots).find(bot => bot.name === 'Beta')
+  assert.ok(alpha, 'Alpha migrated first')
+  assert.ok(beta, 'Beta migrated first')
+  assert.deepEqual([...room.members].sort(), [alpha.id, beta.id].sort(), 'members map to the migrated hub ids')
+  assert.equal(room.admin, alpha.id, 'the admin maps too')
+  // The record is cleared of the room and both Bots.
+  const recorded = readUnsyncedLocalTeam(node.dataDir)
+  assert.equal(recorded.bots.length, 0)
+  assert.equal(recorded.rooms.length, 0)
 })

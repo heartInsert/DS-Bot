@@ -17,7 +17,7 @@ import { MAX_FILE_BYTES, taskLabel } from './protocol.js'
 import { bestDevice, hintedDevice } from './select.js'
 import { createSessionSync } from './session-sync.js'
 import { createTeamWrite } from './team-write.js'
-import { backupTeam, createTeamSource, readUnsyncedLocalTeam, recordUnsyncedLocalTeam, syncTeam, teamApplyMarkerPath } from './team-sync.js'
+import { backupTeam, createTeamSource, readUnsyncedLocalTeam, removeUnsyncedLocalTeam, syncTeam, teamApplyMarkerPath, UNSYNCED_NODE_AFTER_JOIN } from './team-sync.js'
 
 const DEFAULT_PORT = 8787
 const DEFAULT_WAIT_MS = 20_000
@@ -506,6 +506,22 @@ export function install(rt) {
 
   const savedDevice = () => readDevice(options.dataDir)
 
+  // The local Bots and groups a take-over recorded, shown read-only. Pre-join entries are
+  // the team this machine held before it joined and are never submitted on their own; the
+  // pending count is what still waits for the hub to accept its migration.
+  const unsyncedStatus = () => {
+    const record = readUnsyncedLocalTeam(options.dataDir)
+    if (record === undefined || (record.bots.length === 0 && record.rooms.length === 0)) return undefined
+    return {
+      preJoin: [
+        ...record.bots.filter(entry => entry.origin !== UNSYNCED_NODE_AFTER_JOIN).map(entry => ({ kind: 'bot', id: entry.id, name: entry.name })),
+        ...record.rooms.filter(entry => entry.origin !== UNSYNCED_NODE_AFTER_JOIN).map(entry => ({ kind: 'room', id: entry.id, name: entry.name })),
+      ],
+      pending: record.bots.filter(entry => entry.origin === UNSYNCED_NODE_AFTER_JOIN).length
+        + record.rooms.filter(entry => entry.origin === UNSYNCED_NODE_AFTER_JOIN).length,
+    }
+  }
+
   const nodeStatus = () => {
     const info = nodeWorker?.info()
     return {
@@ -519,6 +535,7 @@ export function install(rt) {
       ...(lastBackup === undefined ? {} : { backup: lastBackup.dir }),
       ...(lastSync === undefined ? {} : { team: lastSync }),
       ...(joining === undefined ? {} : { joining: { ...joining } }),
+      ...(unsyncedStatus() === undefined ? {} : { unsynced: unsyncedStatus() }),
     }
   }
 
@@ -750,36 +767,77 @@ export function install(rt) {
   }
 
   // Submits the local Bots and group chats a take-over recorded to the hub as creates.
-  // Each write keeps the recorded entry until it is accepted, so an offline moment only
-  // delays the migration; nothing is deleted until it lands.
+  // Only entries made on this node after a previous apply (`node-after-join`) migrate; the
+  // pre-join team is preserved and shown, never submitted on its own. Bots go first so a
+  // room's members can be mapped to their hub ids; a room whose members cannot be resolved
+  // stays pending rather than being created broken. One run at a time (single flight) and
+  // a deterministic op id per entry keep a retry idempotent, even across a restart.
+  let migrating
   const migrateUnsynced = async () => {
     const session = nodeWorker?.session?.()
     if (session === undefined) return
-    const recorded = readUnsyncedLocalTeam(options.dataDir)
-    if (recorded === undefined) return
-    const remaining = { bots: [], rooms: [] }
-    for (const bot of recorded.bots ?? []) {
+    if (migrating !== undefined) return migrating
+    const run = async () => {
+      const recorded = readUnsyncedLocalTeam(options.dataDir)
+      if (recorded === undefined) return
+      const hubUrl = nodeJoined?.hubUrl ?? savedDevice()?.hubUrl ?? ''
+      // The hub's own Bot ids, so a room member that is already a hub Bot is kept, and one
+      // that is neither migrated nor on the hub is dropped.
+      let hubBotIds = new Set()
       try {
-        await session.teamWrite('create-bot', {
-          name: bot.name, role: bot.role, color: bot.color, instructions: bot.instructions,
-          brief: bot.brief, avatar: bot.avatar, model: bot.model, effort: bot.effort,
-        })
+        const list = await session.bots()
+        hubBotIds = new Set((Array.isArray(list?.bots) ? list.bots : []).map(bot => bot.id).filter(Boolean))
       } catch {
-        remaining.bots.push(bot)
+        // The hub list is unavailable; members still resolve through migratedBots.
+      }
+      const migrated = { ...recorded.migratedBots }
+      // Bots first, so a room can be mapped to their hub ids.
+      for (const bot of recorded.bots ?? []) {
+        if (bot.origin !== UNSYNCED_NODE_AFTER_JOIN) continue
+        try {
+          const made = await session.teamWrite('create-bot', {
+            name: bot.name, role: bot.role, color: bot.color, instructions: bot.instructions,
+            brief: bot.brief, avatar: bot.avatar, model: bot.model, effort: bot.effort,
+          }, { opId: `migrate:bot:${hubUrl}:${bot.id}` })
+          if (typeof made?.id === 'string' && made.id !== '') migrated[bot.id] = made.id
+          removeUnsyncedLocalTeam(options.dataDir, { bots: [bot.id], migratedBots: migrated })
+        } catch {
+          // Still pending: the next sync retries it.
+        }
+      }
+      // Then rooms, mapping members through the migrated Bots and the hub's own list.
+      for (const room of recorded.rooms ?? []) {
+        if (room.origin !== UNSYNCED_NODE_AFTER_JOIN) continue
+        const members = []
+        for (const member of Array.isArray(room.members) ? room.members : []) {
+          const hubId = migrated[member] ?? (hubBotIds.has(member) ? member : undefined)
+          if (hubId !== undefined && !members.includes(hubId)) members.push(hubId)
+        }
+        // A group chat needs at least two Bots; fewer means it stays pending, unbroken.
+        if (members.length < 2) continue
+        let admin
+        if (typeof room.admin === 'string' && room.admin !== '') {
+          const adminHubId = migrated[room.admin] ?? (hubBotIds.has(room.admin) ? room.admin : undefined)
+          if (adminHubId !== undefined && members.includes(adminHubId)) admin = adminHubId
+        }
+        try {
+          await session.teamWrite('create-room', {
+            members,
+            name: room.name,
+            ...(admin === undefined ? {} : { admin }),
+          }, { opId: `migrate:room:${hubUrl}:${room.id}` })
+          removeUnsyncedLocalTeam(options.dataDir, { rooms: [room.id] })
+        } catch {
+          // Still pending: the next sync retries it.
+        }
       }
     }
-    for (const room of recorded.rooms ?? []) {
-      try {
-        await session.teamWrite('create-room', {
-          members: Array.isArray(room.members) ? room.members : [],
-          name: room.name,
-          ...(typeof room.admin === 'string' ? { admin: room.admin } : {}),
-        })
-      } catch {
-        remaining.rooms.push(room)
-      }
+    migrating = run()
+    try {
+      await migrating
+    } finally {
+      migrating = undefined
     }
-    recordUnsyncedLocalTeam(options.dataDir, remaining)
   }
 
   const saveJoined = async (value) => {

@@ -389,62 +389,123 @@ export function teamApplyMarkerPath(dataDir) {
   return join(dataDir, 'team-sync.json')
 }
 
-// Where a node records the local Bots and group chats the hub's bundle does not know,
-// so a take-over never drops them silently: they are kept in the backup and listed here,
-// and migrated to the hub as creates once the node is connected.
+// Where a node records the local Bots and group chats the hub's bundle does not own, so
+// a take-over never drops them silently: they are kept in the backup and listed here. The
+// record is merged, never replaced: an entry stays until the hub accepts its migration,
+// and a pre-join entry stays for good.
 export const UNSYNCED_LOCAL_FILE = 'unsynced-local.json'
 export function unsyncedLocalPath(dataDir) {
   return join(dataDir, UNSYNCED_LOCAL_FILE)
 }
 
-/** The local Bots and group chats the hub's team does not name, as `{ bots, rooms }`. */
-export function unsyncedLocalTeam(localState, hubTeam) {
+// Where a recorded entry came from. `pre-join` is the team this machine held before its
+// first take-over: preserved and shown read-only, never submitted on its own.
+// `node-after-join` is an entry made on this node after a previous apply (for example by
+// an older build that wrote locally); these are the ones migrated to the hub.
+export const UNSYNCED_PRE_JOIN = 'pre-join'
+export const UNSYNCED_NODE_AFTER_JOIN = 'node-after-join'
+
+const idSetOf = value => new Set(Array.isArray(value) ? value : value instanceof Set ? [...value] : [])
+
+/**
+ * The local Bots and group chats the hub's team does not name and that the hub has never
+ * owned. An entry is node-local only when its id is absent from the bundle AND absent from
+ * the previously applied hub team (`appliedBotIds` / `appliedRoomIds`): an entry the hub
+ * deleted since the last apply came from the hub, so a node must not re-create it.
+ */
+export function unsyncedLocalTeam(localState, hubTeam, { appliedBotIds, appliedRoomIds } = {}) {
   const hubBots = hubTeam?.bots ?? {}
   const hubRooms = hubTeam?.rooms ?? {}
+  const knownBots = idSetOf(appliedBotIds)
+  const knownRooms = idSetOf(appliedRoomIds)
   const bots = []
   const rooms = []
   for (const [id, bot] of Object.entries(localState?.bots ?? {})) {
-    if (hubBots[id] === undefined) bots.push(bot)
+    if (hubBots[id] === undefined && !knownBots.has(id)) bots.push(bot)
   }
   for (const [id, room] of Object.entries(localState?.rooms ?? {})) {
-    if (hubRooms[id] === undefined) rooms.push(room)
+    if (hubRooms[id] === undefined && !knownRooms.has(id)) rooms.push(room)
   }
   return { bots, rooms }
 }
 
-/** Writes the unsynced local team to the node data dir, or clears it when there is none. */
-export function recordUnsyncedLocalTeam(dataDir, entries, { now = Date.now } = {}) {
-  if (typeof dataDir !== 'string' || dataDir === '') throw new Error('recording the local team needs the multi-device data folder')
-  const bots = Array.isArray(entries?.bots) ? entries.bots : []
-  const rooms = Array.isArray(entries?.rooms) ? entries.rooms : []
-  const path = unsyncedLocalPath(dataDir)
-  if (bots.length === 0 && rooms.length === 0) {
-    try {
-      unlinkSync(path)
-    } catch {
-      // Already gone: nothing unsynced to keep.
-    }
-    return { bots: [], rooms: [] }
-  }
-  const recorded = { recordedAt: new Date(now()).toISOString(), bots, rooms }
-  writeAtomic(path, `${JSON.stringify(recorded, null, 2)}\n`)
-  return recorded
-}
-
-/** Reads the unsynced local team a previous take-over recorded, if any. */
-export function readUnsyncedLocalTeam(dataDir) {
+function readUnsyncedRecord(dataDir) {
   try {
     const parsed = JSON.parse(readFileSync(unsyncedLocalPath(dataDir), 'utf8'))
-    if (parsed !== null && typeof parsed === 'object') {
-      return {
-        bots: Array.isArray(parsed.bots) ? parsed.bots : [],
-        rooms: Array.isArray(parsed.rooms) ? parsed.rooms : [],
-      }
+    if (parsed === null || typeof parsed !== 'object') return undefined
+    return {
+      bots: Array.isArray(parsed.bots) ? parsed.bots.filter(entry => entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && entry.id !== '') : [],
+      rooms: Array.isArray(parsed.rooms) ? parsed.rooms.filter(entry => entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && entry.id !== '') : [],
+      migratedBots: parsed.migratedBots !== null && typeof parsed.migratedBots === 'object' && !Array.isArray(parsed.migratedBots) ? parsed.migratedBots : {},
     }
   } catch {
     // No record yet, or one this version cannot read.
   }
   return undefined
+}
+
+function writeUnsyncedRecord(dataDir, record, now) {
+  const payload = `${JSON.stringify({
+    version: 1,
+    recordedAt: new Date(now()).toISOString(),
+    bots: record.bots,
+    rooms: record.rooms,
+    migratedBots: record.migratedBots,
+  }, null, 2)}\n`
+  writeAtomic(unsyncedLocalPath(dataDir), payload)
+}
+
+/** Reads the unsynced local team a previous take-over recorded, if any. */
+export function readUnsyncedLocalTeam(dataDir) {
+  return readUnsyncedRecord(dataDir)
+}
+
+/**
+ * Merges the given entries into the unsynced record by id. An entry already recorded, or
+ * already migrated, keeps its earlier copy, so a later sync with an empty diff never
+ * clears an entry that still waits for the hub. The file is written, never deleted whole:
+ * a pre-join entry stays forever, and a node-after-join entry leaves only when the hub
+ * accepts its migration.
+ */
+export function recordUnsyncedLocalTeam(dataDir, entries, { now = Date.now } = {}) {
+  if (typeof dataDir !== 'string' || dataDir === '') throw new Error('recording the local team needs the multi-device data folder')
+  const record = readUnsyncedRecord(dataDir) ?? { bots: [], rooms: [], migratedBots: {} }
+  const bots = new Map(record.bots.map(entry => [entry.id, entry]))
+  const rooms = new Map(record.rooms.map(entry => [entry.id, entry]))
+  for (const entry of Array.isArray(entries?.bots) ? entries.bots : []) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string' || entry.id === '') continue
+    if (bots.has(entry.id) || rooms.has(entry.id) || Object.hasOwn(record.migratedBots, entry.id)) continue
+    bots.set(entry.id, entry)
+  }
+  for (const entry of Array.isArray(entries?.rooms) ? entries.rooms : []) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string' || entry.id === '') continue
+    if (rooms.has(entry.id) || bots.has(entry.id) || Object.hasOwn(record.migratedBots, entry.id)) continue
+    rooms.set(entry.id, entry)
+  }
+  const recorded = { bots: [...bots.values()], rooms: [...rooms.values()], migratedBots: record.migratedBots }
+  writeUnsyncedRecord(dataDir, recorded, now)
+  return recorded
+}
+
+/**
+ * Removes entries the hub accepted (a migrated Bot or room) and records the hub id a Bot
+ * received, so a room's members can be mapped. The file is never deleted whole.
+ */
+export function removeUnsyncedLocalTeam(dataDir, { bots = [], rooms = [], migratedBots = {} } = {}) {
+  if (typeof dataDir !== 'string' || dataDir === '') throw new Error('updating the local team record needs the multi-device data folder')
+  const record = readUnsyncedRecord(dataDir)
+  if (record === undefined) return undefined
+  const botIds = new Set(Array.isArray(bots) ? bots : [])
+  const roomIds = new Set(Array.isArray(rooms) ? rooms : [])
+  const migrated = { ...record.migratedBots }
+  for (const [id, hubId] of Object.entries(migratedBots ?? {})) migrated[id] = hubId
+  const recorded = {
+    bots: record.bots.filter(entry => !botIds.has(entry.id)),
+    rooms: record.rooms.filter(entry => !roomIds.has(entry.id)),
+    migratedBots: migrated,
+  }
+  writeUnsyncedRecord(dataDir, recorded, Date.now)
+  return recorded
 }
 
 /** What this node last applied, so a reconnect with nothing new writes nothing. */
@@ -478,16 +539,33 @@ export async function syncTeam({ rt, hubUrl, token, dataDir, hubId, backup, time
   const bundle = await fetchTeam({ hubUrl, token, timeoutMs, tries })
   const marker = readApplyMarker(dataDir)
   const keyed = { ...bundle, hubId }
-  if (sameBundle(marker, keyed)) {
-    return { applied: false, unchanged: true, revision: bundle.revision, hub: bundle.hub ?? null, backup: backup?.dir ?? null }
-  }
   // Before the hub's team replaces the local one, remember the Bots and group chats this
-  // machine holds that the hub does not, so a take-over never drops them silently.
-  let unsynced
+  // machine holds that the hub has never owned. Entries the hub deleted since the last
+  // apply came from the hub and are not recorded; on the first take-over (no marker) the
+  // pre-join team is recorded as `pre-join`, preserved and shown, never submitted.
+  let unsynced = { bots: 0, rooms: 0 }
   try {
-    unsynced = recordUnsyncedLocalTeam(dataDir, unsyncedLocalTeam(rt.state, bundle.team))
+    const found = unsyncedLocalTeam(rt.state, bundle.team, {
+      appliedBotIds: marker?.appliedBotIds,
+      appliedRoomIds: marker?.appliedRoomIds,
+    })
+    if (found.bots.length > 0 || found.rooms.length > 0) {
+      const origin = marker === undefined ? UNSYNCED_PRE_JOIN : UNSYNCED_NODE_AFTER_JOIN
+      recordUnsyncedLocalTeam(dataDir, {
+        bots: found.bots.map(bot => ({ ...bot, origin })),
+        rooms: found.rooms.map(room => ({ ...room, origin })),
+      })
+    }
+    const recorded = readUnsyncedLocalTeam(dataDir)
+    unsynced = {
+      bots: Array.isArray(recorded?.bots) ? recorded.bots.length : 0,
+      rooms: Array.isArray(recorded?.rooms) ? recorded.rooms.length : 0,
+    }
   } catch (error) {
     log('ds-bot lan: could not record the unsynced local team: %s', error.message)
+  }
+  if (sameBundle(marker, keyed)) {
+    return { applied: false, unchanged: true, revision: bundle.revision, hub: bundle.hub ?? null, backup: backup?.dir ?? null, unsynced }
   }
   const result = await applyTeamBundle({ rt, bundle, backup })
   writeApplyMarker(dataDir, {
@@ -498,9 +576,11 @@ export async function syncTeam({ rt, hubUrl, token, dataDir, hubId, backup, time
     backup: backup?.dir ?? null,
     bots: result.bots,
     memory: result.memory,
+    appliedBotIds: Object.keys(bundle.team?.bots ?? {}),
+    appliedRoomIds: Object.keys(bundle.team?.rooms ?? {}),
   })
   log('ds-bot lan: took over the team from %s (%d bots, %d memory files)', bundle.hub ?? hubUrl, result.bots, result.memory)
-  return { ...result, hubId, unsynced: { bots: unsynced?.bots?.length ?? 0, rooms: unsynced?.rooms?.length ?? 0 } }
+  return { ...result, hubId, unsynced }
 }
 
 const baseOf = hubUrl => String(hubUrl ?? '').replace(/\/+$/, '')
