@@ -403,6 +403,9 @@ export function hubChatAnswer({ replica, status, reference, cursor } = {}) {
       botName: replica.botName,
       roomName: replica.roomName,
       items: Array.isArray(replica.items) ? replica.items : [],
+      approvals: Array.isArray(replica.approvals) ? replica.approvals : [],
+      ...(replica.question === undefined ? {} : { question: replica.question }),
+      ...(replica.view === undefined ? {} : { view: replica.view }),
     }),
   }
 }
@@ -426,6 +429,25 @@ export async function sendHubChat(session, reference, text, messageId) {
 export async function readHubEarlier(session, reference) {
   await session.open(reference)
   return session.earlier(reference)
+}
+
+// A card answer the node forwards to the hub, which applies it to the one writer. The
+// node never answers against its own (empty) Session; it only relays the answer and lets
+// the hub resolve it idempotently by card id.
+export function answerHubApproval(session, approvalId, choice) {
+  return session.answerApproval(approvalId, choice)
+}
+export function answerHubQuestion(session, reference, questionId, answer) {
+  return session.answerQuestion(reference, questionId, answer)
+}
+export function dismissHubQuestion(session, reference) {
+  return session.dismissQuestion(reference)
+}
+export function answerHubView(session, reference, viewId, action, values) {
+  return session.answerView(reference, viewId, action, values)
+}
+export function dismissHubView(session, reference) {
+  return session.dismissView(reference)
 }
 
 export function install(rt) {
@@ -896,6 +918,26 @@ export function install(rt) {
     }
   }
 
+  // A card answer goes through the node's worker to the hub. A stale or invalid answer
+  // keeps its own message (the card is gone or the answer was wrong), never a made-up
+  // "hub is not reachable"; only a real network failure reads as offline.
+  const hubCardAnswer = async (make) => {
+    const session = nodeWorker?.session?.()
+    if (session === undefined) throw new Error('This computer is not joined to a hub.')
+    try {
+      return await make(session)
+    } catch (error) {
+      if (error?.code === 'hub/offline' || error?.fatal === true || error?.code === 'bot/stale' || error?.code === 'bot/invalid') throw error
+      throw new Error(`The hub is not reachable; the answer was not sent. ${error?.message ?? ''}`.trim())
+    }
+  }
+
+  const hubApprovalAnswer = (body = {}) => hubCardAnswer(session => answerHubApproval(session, String(body?.approvalId ?? ''), body?.choice))
+  const hubQuestionAnswer = (body = {}) => hubCardAnswer(session => answerHubQuestion(session, hubReference(body), String(body?.questionId ?? ''), body?.answer ?? {}))
+  const hubQuestionDismiss = (body = {}) => hubCardAnswer(session => dismissHubQuestion(session, hubReference(body)))
+  const hubViewAnswer = (body = {}) => hubCardAnswer(session => answerHubView(session, hubReference(body), String(body?.viewId ?? ''), body?.action, body?.values))
+  const hubViewDismiss = (body = {}) => hubCardAnswer(session => dismissHubView(session, hubReference(body)))
+
   Object.defineProperty(rt, 'multiDeviceEnabled', { get: () => enabled, configurable: true })
   Object.defineProperty(rt, 'multiDeviceError', { get: () => failure, configurable: true })
   Object.assign(rt, {
@@ -917,6 +959,12 @@ export function install(rt) {
     multiDeviceHubConversation: hubConversation,
     multiDeviceHubSend: hubSend,
     multiDeviceHubEarlier: hubEarlier,
+    // A card answer the node's chat view forwards to the hub through the one writer.
+    multiDeviceHubApprovalAnswer: hubApprovalAnswer,
+    multiDeviceHubQuestionAnswer: hubQuestionAnswer,
+    multiDeviceHubQuestionDismiss: hubQuestionDismiss,
+    multiDeviceHubViewAnswer: hubViewAnswer,
+    multiDeviceHubViewDismiss: hubViewDismiss,
   })
 
   // The saved choice is read once the team file is loaded; the profile only supplies

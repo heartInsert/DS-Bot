@@ -410,19 +410,11 @@ export function install(rt) {
         }
         case 'dismiss-question':
           await rt.load()
-          if (rt.own(state.questions, body.sessionId) !== undefined) {
-            rt.closeCard(body.sessionId, state.questions[body.sessionId], 'dismissed')
-            delete state.questions[body.sessionId]
-            await rt.save()
-          }
+          await rt.dismissQuestion(body.sessionId)
           return ok(true)
         case 'dismiss-view':
           await rt.load()
-          if (rt.own(state.views, body.sessionId) !== undefined) {
-            rt.closeCard(body.sessionId, state.views[body.sessionId], 'dismissed')
-            delete state.views[body.sessionId]
-            await rt.save()
-          }
+          await rt.dismissView(body.sessionId)
           return ok(true)
         case 'secret-set':
         case 'secret-allow':
@@ -479,27 +471,7 @@ export function install(rt) {
         case 'view-reply': {
           if (typeof body.sessionId !== 'string') return fail('Nothing to send', 'bot/invalid')
           await rt.load()
-          const past = rt.pastOwners.get(body.sessionId)
-          const sessionId = rt.botOf(body.sessionId) ? rt.chatOf(body.sessionId) : past && past.roomId === undefined ? rt.chatOf(past.botId) : body.sessionId
-          const pending = rt.own(state.views, sessionId)
-          if (pending === undefined || pending.id !== body.viewId) return fail('This view is no longer open', 'bot/stale')
-          const checked = validateViewAnswer(pending.view, body.action, body.values)
-          if (checked.error !== undefined) return fail(checked.error, 'bot/invalid')
-          const reply = viewReply(pending, body.action, body.values)
-          if (reply === undefined) return fail('Nothing to send', 'bot/invalid')
-          // Claim the view before queueing so a second answer is refused.
-          delete state.views[sessionId]
-          try {
-            await rt.ensureCapabilities(sessionId)
-            const agent = await rt.resolveAgent(sessionId)
-            agent.followup(createUserMessage({ content: [{ type: 'text', text: reply.text }], source: reply.source }))
-            await ctx.sessions.flush(agent.session)
-          } catch (error) {
-            state.views[sessionId] ??= pending
-            throw error
-          }
-          await rt.save()
-          return ok(true)
+          return ok(await rt.answerView(body.sessionId, body.viewId, body.action, body.values))
         }
         case 'send': {
           const text = String(body.text ?? '').trim()
@@ -675,6 +647,18 @@ export function install(rt) {
           return ok(await rt.multiDeviceHubSend(body))
         case 'hub-earlier':
           return ok(await rt.multiDeviceHubEarlier(body))
+        // The node's chat view forwards a card answer to the hub through the one writer:
+        // the device token authorizes it on the hub, never this machine's own Session.
+        case 'hub-approval-answer':
+          return ok(await rt.multiDeviceHubApprovalAnswer(body))
+        case 'hub-question-answer':
+          return ok(await rt.multiDeviceHubQuestionAnswer(body))
+        case 'hub-question-dismiss':
+          return ok(await rt.multiDeviceHubQuestionDismiss(body))
+        case 'hub-view-answer':
+          return ok(await rt.multiDeviceHubViewAnswer(body))
+        case 'hub-view-dismiss':
+          return ok(await rt.multiDeviceHubViewDismiss(body))
         case 'diagnostics':
           await rt.load()
           return ok(await rt.diagnostics.report(body))
@@ -717,11 +701,19 @@ export function install(rt) {
     }, AbortSignal.timeout(30_000))
   }
 
+  // A Bot id or a chat part id resolves to the part the card lives on: its current own
+  // chat, or an earlier segment of it.
+  function chatSessionOf(sessionRef) {
+    const past = rt.pastOwners.get(sessionRef)
+    return rt.botOf(sessionRef) ? rt.chatOf(sessionRef)
+      : past !== undefined && past.roomId === undefined ? rt.chatOf(past.botId)
+        : sessionRef
+  }
+
   // The user's answer to an ask_user card, from the web or an IM chat. A Bot id or an
   // earlier part of its own chat means the current one.
   async function answerQuestion(sessionRef, questionId, answer) {
-    const past = rt.pastOwners.get(sessionRef)
-    const sessionId = rt.botOf(sessionRef) ? rt.chatOf(sessionRef) : past && past.roomId === undefined ? rt.chatOf(past.botId) : sessionRef
+    const sessionId = chatSessionOf(sessionRef)
     const question = rt.own(state.questions, sessionId)
     if (question === undefined || question.id !== questionId) throw Object.assign(new Error('This question is no longer open'), { code: 'bot/stale' })
     const reply = questionReply(question, answer)
@@ -741,7 +733,50 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { sendUser, answerQuestion })
+  // The user's answer to a show_view card. Same shape as the question path: the pending
+  // view is claimed before the reply is queued, so a second answer is refused.
+  async function answerView(sessionRef, viewId, action, values) {
+    const sessionId = chatSessionOf(sessionRef)
+    const pending = rt.own(state.views, sessionId)
+    if (pending === undefined || pending.id !== viewId) throw Object.assign(new Error('This view is no longer open'), { code: 'bot/stale' })
+    const checked = validateViewAnswer(pending.view, action, values)
+    if (checked.error !== undefined) throw Object.assign(new Error(checked.error), { code: 'bot/invalid' })
+    const reply = viewReply(pending, action, values)
+    if (reply === undefined) throw Object.assign(new Error('Nothing to send'), { code: 'bot/invalid' })
+    delete state.views[sessionId]
+    try {
+      await rt.ensureCapabilities(sessionId)
+      const agent = await rt.resolveAgent(sessionId)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: reply.text }], source: reply.source }))
+      await ctx.sessions.flush(agent.session)
+    } catch (error) {
+      state.views[sessionId] ??= pending
+      throw error
+    }
+    await rt.save()
+    return true
+  }
+
+  // Dismissing a card closes it without an answer; a card already gone is a no-op.
+  async function dismissQuestion(sessionRef) {
+    const sessionId = chatSessionOf(sessionRef)
+    if (rt.own(state.questions, sessionId) === undefined) return true
+    rt.closeCard(sessionId, state.questions[sessionId], 'dismissed')
+    delete state.questions[sessionId]
+    await rt.save()
+    return true
+  }
+
+  async function dismissView(sessionRef) {
+    const sessionId = chatSessionOf(sessionRef)
+    if (rt.own(state.views, sessionId) === undefined) return true
+    rt.closeCard(sessionId, state.views[sessionId], 'dismissed')
+    delete state.views[sessionId]
+    await rt.save()
+    return true
+  }
+
+  Object.assign(rt, { sendUser, answerQuestion, answerView, dismissQuestion, dismissView })
 
   // An exact Fetch route on the shared /api channel; the browser authenticates with its session cookie.
   ctx.effect(() => ctx.connection.fetch.register({

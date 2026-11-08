@@ -92,6 +92,12 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
   // A send that is still in flight, so two concurrent submits of the same id wait for
   // the one write instead of racing it.
   const inflight = new Map()
+  // Card answers the hub has already settled, kept so a retry answers "duplicate"
+  // instead of being mistaken for a card that never opened. In-memory only: cards are
+  // live DSH state and do not survive a hub restart anyway.
+  const settledApprovals = new Map()
+  const settledQuestions = new Map()
+  const settledViews = new Map()
 
   // The durable send log. Without a dataDir the hub is a CLI process with no team, so
   // the dedupe is in-memory only (the first protocol's behavior).
@@ -305,20 +311,64 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
     })
   }
 
+  // The live cards a conversation holds, on top of its rendered items. A question or a
+  // view is a Bot's own-chat card (`state.questions` / `state.views`, keyed by the chat
+  // part); an approval belongs to the Bot or to a member of the group. None of these
+  // are in `displayItems` — they are live DSH state, which is why the snapshot carries
+  // them beside the items instead of inside them.
+  const ownOf = (object, key) => Object.prototype.hasOwnProperty.call(object, key)
+
+  function approvalsOf(page) {
+    const all = typeof rt.approvalsView === 'function' ? rt.approvalsView() : []
+    const wanted = page.conv.kind === 'bot'
+      ? all.filter(entry => entry.roomId === undefined && entry.botId === page.conv.id)
+      : all.filter(entry => entry.roomId === page.conv.id)
+    return wanted.map(entry => ({
+      id: entry.id,
+      botId: entry.botId,
+      ...(typeof rt.botOf === 'function' && rt.botOf(entry.botId)?.name !== undefined ? { botName: rt.botOf(entry.botId).name } : {}),
+      tool: entry.tool,
+      reason: entry.reason,
+      detail: entry.detail,
+      answerable: entry.answerable,
+      at: entry.at,
+    }))
+  }
+
+  function pendingCardOf(botId, field) {
+    const sessionId = typeof rt.chatOf === 'function' ? rt.chatOf(botId) : botId
+    const cards = rt.state?.[field]
+    if (cards === null || typeof cards !== 'object') return undefined
+    return ownOf(cards, sessionId) ? cards[sessionId] : undefined
+  }
+
+  function cardsOf(page) {
+    const cards = { approvals: approvalsOf(page) }
+    if (page.conv.kind === 'bot') {
+      const question = pendingCardOf(page.conv.id, 'questions')
+      if (question !== undefined) cards.question = question
+      const view = pendingCardOf(page.conv.id, 'views')
+      if (view !== undefined) cards.view = view
+    }
+    return cards
+  }
+
   async function render(reference) {
     const page = pageOf(reference)
     const rendered = await page.sessionOf()
     const all = Array.isArray(rendered.items) ? rendered.items : []
     const capped = capItems(all.slice(-maxItems))
     const items = stampIds(rendered.sessionId ?? null, capped.items)
+    const cards = cardsOf(page)
     return {
-      key: digest({ sessionId: rendered.sessionId ?? null, items }),
+      key: digest({ sessionId: rendered.sessionId ?? null, items, cards }),
       conv: page.conv,
       name: page.name,
       sessionId: rendered.sessionId ?? null,
       items,
       hidden: capped.hidden,
       cursor: rendered.cursor ?? null,
+      ...cards,
     }
   }
 
@@ -418,6 +468,9 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
       hidden,
       cursor,
       updatedAt,
+      approvals: entry.approvals ?? [],
+      ...(entry.question === undefined ? {} : { question: entry.question }),
+      ...(entry.view === undefined ? {} : { view: entry.view }),
     }
   }
 
@@ -536,6 +589,87 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
     }
   }
 
+  const outcomeOf = choice => ({ allow: 'allowed-once', reject: 'rejected' })[choice]
+
+  // A node's card answer reaches the hub's existing answer paths through the device
+  // token. Each is idempotent by the card id: a retry returns the settled answer and
+  // changes nothing, and an answer on a card the hub no longer holds (expired, already
+  // answered elsewhere, or unknown) is a clear refusal. Answering never runs a tool —
+  // it only resolves a pending request, or is refused when there is nothing left to
+  // resolve, so a repeated answer can never re-execute a tool that already ran.
+  async function answerApproval({ approvalId, choice } = {}) {
+    await ready()
+    const id = String(approvalId ?? '')
+    if (id === '') throw fail('the approval was not named')
+    const outcome = outcomeOf(choice)
+    if (outcome === undefined) throw fail('Choose allow or reject')
+    const settled = settledApprovals.get(id)
+    if (settled !== undefined) return { ok: true, duplicate: true, outcome: settled, choice }
+    if (typeof rt.answerApproval !== 'function') throw fail('approvals are not answered here', 503)
+    try {
+      rt.answerApproval(id, choice)
+    } catch (error) {
+      if (error?.code === 'bot/stale') throw Object.assign(fail('This approval is no longer open', 409), { code: 'bot/stale' })
+      throw error
+    }
+    settledApprovals.set(id, outcome)
+    return { ok: true, duplicate: false, outcome, choice }
+  }
+
+  async function answerQuestion({ botId, questionId, answer } = {}) {
+    await ready()
+    const id = String(questionId ?? '')
+    if (id === '') throw fail('the question was not named')
+    const settled = settledQuestions.get(id)
+    if (settled !== undefined) return { ok: true, duplicate: true }
+    if (typeof rt.answerQuestion !== 'function') throw fail('questions are not answered here', 503)
+    const page = pageOf({ kind: 'bot', id: String(botId ?? '') })
+    try {
+      await rt.answerQuestion(page.conv.id, id, answer ?? {})
+    } catch (error) {
+      if (error?.code === 'bot/stale') throw Object.assign(fail('This question is no longer open', 409), { code: 'bot/stale' })
+      if (error?.code === 'bot/invalid') throw Object.assign(fail(error.message || 'Nothing to send', 400), { code: 'bot/invalid' })
+      throw error
+    }
+    settledQuestions.set(id, 'answered')
+    return { ok: true, duplicate: false }
+  }
+
+  async function answerView({ botId, viewId, action, values } = {}) {
+    await ready()
+    const id = String(viewId ?? '')
+    if (id === '') throw fail('the view was not named')
+    const settled = settledViews.get(id)
+    if (settled !== undefined) return { ok: true, duplicate: true }
+    if (typeof rt.answerView !== 'function') throw fail('views are not answered here', 503)
+    const page = pageOf({ kind: 'bot', id: String(botId ?? '') })
+    try {
+      await rt.answerView(page.conv.id, id, action, values)
+    } catch (error) {
+      if (error?.code === 'bot/stale') throw Object.assign(fail('This view is no longer open', 409), { code: 'bot/stale' })
+      if (error?.code === 'bot/invalid') throw Object.assign(fail(error.message || 'Nothing to send', 400), { code: 'bot/invalid' })
+      throw error
+    }
+    settledViews.set(id, 'answered')
+    return { ok: true, duplicate: false }
+  }
+
+  async function dismissQuestion({ botId } = {}) {
+    await ready()
+    if (typeof rt.dismissQuestion !== 'function') throw fail('questions are not answered here', 503)
+    const page = pageOf({ kind: 'bot', id: String(botId ?? '') })
+    await rt.dismissQuestion(page.conv.id)
+    return { ok: true }
+  }
+
+  async function dismissView({ botId } = {}) {
+    await ready()
+    if (typeof rt.dismissView !== 'function') throw fail('views are not answered here', 503)
+    const page = pageOf({ kind: 'bot', id: String(botId ?? '') })
+    await rt.dismissView(page.conv.id)
+    return { ok: true }
+  }
+
   return {
     epoch,
     get revision() {
@@ -547,6 +681,11 @@ export function createSessionSync({ rt, dataDir, log = () => {}, now = Date.now,
     snapshot,
     earlier,
     send,
+    answerApproval,
+    answerQuestion,
+    answerView,
+    dismissQuestion,
+    dismissView,
     // The Devices page and tests read this without touching a node.
     status: () => ({
       epoch,

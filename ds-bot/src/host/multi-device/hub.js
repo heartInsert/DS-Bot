@@ -575,6 +575,34 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       })
       return send(response, 200, { ...result, node: node.name })
     }
+    // A node's card answer is forwarded to the hub's existing answer paths. The device
+    // token authorizes it; the idempotency and the stale/expired handling live in the
+    // session sync, so a repeated answer changes nothing and never re-runs a tool.
+    if (request.method === 'POST' && path === '/session/approval') {
+      const body = await readJson(request)
+      const result = await sessionSync.answerApproval({ approvalId: body.approvalId, choice: body.choice })
+      return send(response, 200, { ...result, node: node.name })
+    }
+    if (request.method === 'POST' && path === '/session/question') {
+      const body = await readJson(request)
+      const result = await sessionSync.answerQuestion({ botId: body.botId, questionId: body.questionId, answer: body.answer })
+      return send(response, 200, { ...result, node: node.name })
+    }
+    if (request.method === 'POST' && path === '/session/question-dismiss') {
+      const body = await readJson(request)
+      const result = await sessionSync.dismissQuestion({ botId: body.botId })
+      return send(response, 200, { ...result, node: node.name })
+    }
+    if (request.method === 'POST' && path === '/session/view') {
+      const body = await readJson(request)
+      const result = await sessionSync.answerView({ botId: body.botId, viewId: body.viewId, action: body.action, values: body.values })
+      return send(response, 200, { ...result, node: node.name })
+    }
+    if (request.method === 'POST' && path === '/session/view-dismiss') {
+      const body = await readJson(request)
+      const result = await sessionSync.dismissView({ botId: body.botId })
+      return send(response, 200, { ...result, node: node.name })
+    }
     return send(response, 404, { error: 'not found' })
   }
 
@@ -656,7 +684,9 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       return send(response, 200, { ok: true, time: new Date(now()).toISOString() })
     }
     if (request.method === 'POST' && path === '/result') return handleResult(request, response)
-    if (path === '/session' || path === '/session/bots' || path === '/session/list') return handleSession(request, response, path, target.searchParams)
+    if (path === '/session' || path === '/session/bots' || path === '/session/list'
+      || path === '/session/approval' || path === '/session/question' || path === '/session/question-dismiss'
+      || path === '/session/view' || path === '/session/view-dismiss') return handleSession(request, response, path, target.searchParams)
     if (path === '/team') return handleTeam(request, response)
     if (path.startsWith('/admin/')) return handleAdmin(request, response, path)
     return send(response, 404, { error: 'not found' })

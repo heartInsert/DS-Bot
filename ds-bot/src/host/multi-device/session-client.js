@@ -299,6 +299,9 @@ export function createSessionClient({
       cursor: body.cursor ?? null,
       updatedAt: body.updatedAt ?? null,
       savedAt: iso(),
+      approvals: Array.isArray(body.approvals) ? body.approvals : [],
+      ...(body.question === undefined ? {} : { question: body.question }),
+      ...(body.view === undefined ? {} : { view: body.view }),
     }
     const merged = body.reset === true ? mergeItems(conv.replica?.items, incoming.items) : incoming.items
     conv.replica = { ...incoming, items: merged }
@@ -348,6 +351,34 @@ export function createSessionClient({
         backoff = Math.min(backoff * 2, 30_000)
       }
     }
+  }
+
+  // A card answer is only ever answered in a Bot's own chat; a group chat has no
+  // question or view of its own, and an approval is named by its id, not its place.
+  async function resolveCardBot(reference) {
+    if (team === undefined) await refreshTeam()
+    const found = resolve(reference)
+    if (found.kind !== 'bot') throw failure('cards are answered in a Bot\'s own chat, not a group chat', { code: 'bot/invalid' })
+    return found.id
+  }
+
+  // A card answer POST: the same device token and offline refusal as a message, plus a
+  // clear result when the card is no longer open. The hub answers idempotently; a stale
+  // answer (expired, already answered, unknown) is refused with `bot/stale` and nothing
+  // changes on either side.
+  async function cardPost(path, body) {
+    let response
+    try {
+      response = await request(path, { method: 'POST', body: JSON.stringify(body), timeoutMs: REQUEST_TIMEOUT_MS })
+    } catch (error) {
+      throw failure(`the hub is not reachable; the answer was not sent (${error.message})`, { code: 'hub/offline' })
+    }
+    const answer = await response.json().catch(() => ({}))
+    if (response.status === 401) throw failure('the hub does not know this device; pair it again', { fatal: true })
+    if (response.status === 409) throw failure(answer.error ?? 'This answer is no longer open', { code: 'bot/stale' })
+    if (response.status === 400) throw failure(answer.error ?? 'Nothing to send', { code: 'bot/invalid' })
+    if (!response.ok) throw failure(answer.error ?? `the hub refused the answer: HTTP ${response.status}`, { code: response.status === 503 ? 'hub/offline' : undefined })
+    return answer
   }
 
   return {
@@ -435,6 +466,25 @@ export function createSessionClient({
       if (!response.ok) throw failure(answer.error ?? `the hub refused the message: HTTP ${response.status}`, { code: response.status === 503 ? 'hub/offline' : undefined })
       if (!running) void pullOnce().catch(error => { lastError = error.message })
       return { ...answer, messageId }
+    },
+    // A card answer the node forwards to the hub. The reference names the Bot whose
+    // chat holds the card; the hub resolves it and answers idempotently by card id.
+    answerApproval: (approvalId, choice) => cardPost('/session/approval', { approvalId, choice }),
+    async answerQuestion(reference, questionId, answer) {
+      const botId = await resolveCardBot(reference)
+      return cardPost('/session/question', { botId, questionId, answer })
+    },
+    async dismissQuestion(reference) {
+      const botId = await resolveCardBot(reference)
+      return cardPost('/session/question-dismiss', { botId })
+    },
+    async answerView(reference, viewId, action, values) {
+      const botId = await resolveCardBot(reference)
+      return cardPost('/session/view', { botId, viewId, action, values })
+    },
+    async dismissView(reference) {
+      const botId = await resolveCardBot(reference)
+      return cardPost('/session/view-dismiss', { botId })
     },
     async start() {
       if (running) return info()
