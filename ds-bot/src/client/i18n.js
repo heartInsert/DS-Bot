@@ -1616,6 +1616,28 @@ const HOST_ZH = {
   'The command carries no pairing code: the device token stays in device.json on that machine.': '这条命令不含配对码：设备令牌留在那台机器的 device.json 里。',
   'Other machines run read-only commands directly; other commands and file writes ask you first. This computer is the hub.': '其他机器直接执行只读命令；其他命令和文件写入会先问你。这台电脑是中心。',
   'Machines run read-only commands directly: {commands}. Anything else asks you first.': '机器直接执行只读命令：{commands}。其他操作会先问你。',
+  // LAN multi-device: joining from the page instead of the command line
+  'Let this computer be the hub': '让这台电脑当中心',
+  'Bots here can reach the machines that join it.': '这里的 Bot 可以使用加入这台电脑的机器。',
+  'Devices · {count}': '设备 · {count}',
+  'No device yet.': '还没有设备。',
+  'Allow the machine above to add it.': '允许上面那台机器加入即可添加。',
+  'On the other computer, open Settings → Devices and pick this one under Nearby hubs.': '在另一台电脑上打开 设置 → 设备，在「附近的中心」里点这台电脑。',
+  'On the other computer, turn on multi-device in Settings → Devices.': '在另一台电脑上打开 设置 → 设备，启用多机。',
+  'Nearby hubs': '附近的中心',
+  'Searching…': '正在查找…',
+  'Search again': '重新查找',
+  'No hub found. Check that both computers are on the same Wi-Fi.': '没有找到中心。确认两台电脑连的是同一个 Wi-Fi。',
+  'Join': '加入',
+  'Joined {name}': '已加入 {name}',
+  'Waiting for {name} to allow this computer…': '等待 {name} 允许这台电脑…',
+  '{name} wants to join': '{name} 想加入',
+  Allow: '允许',
+  Deny: '拒绝',
+  Cancel: '取消',
+  Leave: '退出',
+  Advanced: '高级',
+  'Pairing code for the command line': '命令行配对码',
 }
 Object.assign(ZH, HOST_ZH)
 

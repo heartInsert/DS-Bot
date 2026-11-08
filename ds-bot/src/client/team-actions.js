@@ -166,6 +166,12 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     multiDeviceSetEnabled: enabled => after(call('multi-device-enable', { enabled })),
     multiDevicePairCode: () => call('multi-device-pair-code', {}),
     multiDeviceRemove: node => after(call('multi-device-remove', { node })),
+    // Joining a hub from this page: look for one, ask, and answer a machine that asks.
+    multiDeviceScan: () => call('multi-device-scan', {}),
+    multiDeviceJoin: hub => after(call('multi-device-join', { hub })),
+    multiDeviceLeave: () => after(call('multi-device-leave', {})),
+    multiDeviceApprove: request => after(call('multi-device-approve', { request })),
+    multiDeviceDeny: request => after(call('multi-device-deny', { request })),
     stopMemberWork: (roomId, botId) => after(call('stop-member-work', { roomId, botId })),
     stopRoomWork: roomId => after(call('stop-room-work', { roomId })),
     goalDraft: (roomId, text) => after(call('goal-draft', { roomId, text })),

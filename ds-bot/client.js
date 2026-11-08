@@ -1658,7 +1658,29 @@ var HOST_ZH = {
   "Pair that machine once, then run this in the ds-bot folder there. It starts at login and keeps reconnecting after a drop.": "那台机器配对一次后，在它的 ds-bot 目录里运行这条命令。它会在登录时启动，断线后继续重连。",
   "The command carries no pairing code: the device token stays in device.json on that machine.": "这条命令不含配对码：设备令牌留在那台机器的 device.json 里。",
   "Other machines run read-only commands directly; other commands and file writes ask you first. This computer is the hub.": "其他机器直接执行只读命令；其他命令和文件写入会先问你。这台电脑是中心。",
-  "Machines run read-only commands directly: {commands}. Anything else asks you first.": "机器直接执行只读命令：{commands}。其他操作会先问你。"
+  "Machines run read-only commands directly: {commands}. Anything else asks you first.": "机器直接执行只读命令：{commands}。其他操作会先问你。",
+  // LAN multi-device: joining from the page instead of the command line
+  "Let this computer be the hub": "让这台电脑当中心",
+  "Bots here can reach the machines that join it.": "这里的 Bot 可以使用加入这台电脑的机器。",
+  "Devices · {count}": "设备 · {count}",
+  "No device yet.": "还没有设备。",
+  "Allow the machine above to add it.": "允许上面那台机器加入即可添加。",
+  "On the other computer, open Settings → Devices and pick this one under Nearby hubs.": "在另一台电脑上打开 设置 → 设备，在「附近的中心」里点这台电脑。",
+  "On the other computer, turn on multi-device in Settings → Devices.": "在另一台电脑上打开 设置 → 设备，启用多机。",
+  "Nearby hubs": "附近的中心",
+  "Searching…": "正在查找…",
+  "Search again": "重新查找",
+  "No hub found. Check that both computers are on the same Wi-Fi.": "没有找到中心。确认两台电脑连的是同一个 Wi-Fi。",
+  "Join": "加入",
+  "Joined {name}": "已加入 {name}",
+  "Waiting for {name} to allow this computer…": "等待 {name} 允许这台电脑…",
+  "{name} wants to join": "{name} 想加入",
+  Allow: "允许",
+  Deny: "拒绝",
+  Cancel: "取消",
+  Leave: "退出",
+  Advanced: "高级",
+  "Pairing code for the command line": "命令行配对码"
 };
 Object.assign(ZH, HOST_ZH);
 var fill = (text, params) => params ? text.replace(/\{(\w+)\}/g, (match, name) => name in params ? String(params[name]) : match) : text;
@@ -2196,6 +2218,12 @@ function teamActions({ call: call2, after, partFor, roster, ui: ui2, live, cards
     multiDeviceSetEnabled: (enabled) => after(call2("multi-device-enable", { enabled })),
     multiDevicePairCode: () => call2("multi-device-pair-code", {}),
     multiDeviceRemove: (node) => after(call2("multi-device-remove", { node })),
+    // Joining a hub from this page: look for one, ask, and answer a machine that asks.
+    multiDeviceScan: () => call2("multi-device-scan", {}),
+    multiDeviceJoin: (hub) => after(call2("multi-device-join", { hub })),
+    multiDeviceLeave: () => after(call2("multi-device-leave", {})),
+    multiDeviceApprove: (request) => after(call2("multi-device-approve", { request })),
+    multiDeviceDeny: (request) => after(call2("multi-device-deny", { request })),
     stopMemberWork: (roomId, botId) => after(call2("stop-member-work", { roomId, botId })),
     stopRoomWork: (roomId) => after(call2("stop-room-work", { roomId })),
     goalDraft: (roomId, text) => after(call2("goal-draft", { roomId, text })),
@@ -14622,6 +14650,13 @@ function timeText(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString(dateLocale(), { dateStyle: "medium", timeStyle: "short" });
 }
+function hostOf2(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url ?? "");
+  }
+}
 function CopyButton2({ text, label = "Copy" }) {
   const [copied, setCopied] = (0, import_react33.useState)(false);
   (0, import_react33.useEffect)(() => {
@@ -14665,30 +14700,20 @@ function NodeRow({ node, confirming, busy, onRemove }) {
     }, confirming ? t("Click again to remove") : t("Remove"))
   );
 }
-function PairingPanel({ pairing, onClose }) {
+function RequestRow({ request, busy, onAllow, onDeny }) {
+  const meta = [request.hostname, request.os].filter(Boolean).join(" · ");
   return (0, import_react33.createElement)(
     "div",
-    { className: "bt-dev-pairing" },
+    { className: "bt-dev-node" },
+    (0, import_react33.createElement)("span", { className: "bt-dev-dot", "aria-hidden": true }),
     (0, import_react33.createElement)(
-      "div",
-      { className: "bt-dev-pairing-head" },
-      (0, import_react33.createElement)("span", { className: "bt-dev-pairing-label" }, t("Pairing code")),
-      (0, import_react33.createElement)("code", { className: "bt-dev-code" }, pairing.code)
+      "span",
+      { className: "bt-dev-node-copy" },
+      (0, import_react33.createElement)("span", { className: "bt-dev-node-name" }, t("{name} wants to join", { name: request.name })),
+      meta === "" ? null : (0, import_react33.createElement)("span", { className: "bt-dev-node-meta" }, meta)
     ),
-    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("Valid until {time}. One machine, one use.", { time: timeText(pairing.expiresAt) })),
-    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("Run this in the ds-bot folder on the other machine:")),
-    (0, import_react33.createElement)(
-      "div",
-      { className: "bt-dev-command" },
-      (0, import_react33.createElement)("code", null, pairing.command),
-      (0, import_react33.createElement)(CopyButton2, { text: pairing.command, label: "Copy command" })
-    ),
-    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("Replace other-pc with that machine's name. The same command works in PowerShell and in the macOS Terminal.")),
-    (0, import_react33.createElement)(
-      "div",
-      { className: "bt-actions" },
-      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", onClick: onClose }, t("Done"))
-    )
+    (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: () => onAllow(request) }, t("Allow")),
+    (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm bt-dev-remove", disabled: busy, onClick: () => onDeny(request) }, t("Deny"))
   );
 }
 function sharedSessionLink(webUrl) {
@@ -14781,10 +14806,72 @@ function LinkIcon2() {
     (0, import_react33.createElement)("path", { d: "M6.5 9.5l3-3M7 4.5l1-1a2.8 2.8 0 014 4l-1 1M9 11.5l-1 1a2.8 2.8 0 01-4-4l1-1" })
   );
 }
+function CommandPanel({ pairing, daemon, onClose }) {
+  return (0, import_react33.createElement)(
+    "div",
+    { className: "bt-dev-pairing" },
+    (0, import_react33.createElement)(
+      "div",
+      { className: "bt-dev-pairing-head" },
+      (0, import_react33.createElement)("span", { className: "bt-dev-pairing-label" }, t("Pairing code for the command line")),
+      (0, import_react33.createElement)("code", { className: "bt-dev-code" }, pairing.code)
+    ),
+    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("Valid until {time}. One machine, one use.", { time: timeText(pairing.expiresAt) })),
+    (0, import_react33.createElement)(
+      "div",
+      { className: "bt-dev-command" },
+      (0, import_react33.createElement)("code", null, pairing.command),
+      (0, import_react33.createElement)(CopyButton2, { text: pairing.command, label: "Copy command" })
+    ),
+    daemon?.command === void 0 ? null : (0, import_react33.createElement)(
+      "div",
+      { className: "bt-dev-command" },
+      (0, import_react33.createElement)("code", null, daemon.command),
+      (0, import_react33.createElement)(CopyButton2, { text: daemon.command, label: "Copy command" })
+    ),
+    (0, import_react33.createElement)(
+      "div",
+      { className: "bt-actions" },
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", onClick: onClose }, t("Done"))
+    )
+  );
+}
+function Nearby({ hubs, scanning, busy, onScan, onJoin }) {
+  if (scanning) return (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("Searching…"));
+  if (hubs.length === 0) {
+    return (0, import_react33.createElement)(
+      "div",
+      { className: "bt-dev-hint" },
+      t("No hub found. Check that both computers are on the same Wi-Fi."),
+      (0, import_react33.createElement)(
+        "div",
+        { className: "bt-actions" },
+        (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: onScan }, t("Search again"))
+      )
+    );
+  }
+  return hubs.map((hub) => (0, import_react33.createElement)(
+    "div",
+    { key: hub.id ?? hub.url, className: "bt-dev-node" },
+    (0, import_react33.createElement)("span", { className: "bt-dev-dot", "aria-hidden": true }),
+    (0, import_react33.createElement)(
+      "span",
+      { className: "bt-dev-node-copy" },
+      (0, import_react33.createElement)("span", { className: "bt-dev-node-name" }, hub.name),
+      (0, import_react33.createElement)("span", { className: "bt-dev-node-meta" }, hub.url)
+    ),
+    (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: () => onJoin(hub.url) }, t("Join"))
+  ));
+}
 function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4, Switch: Switch2 }) {
   const fallback = roster.multiDevice ?? { available: true, enabled: false, hub: { state: "off" }, nodes: [], policy: [] };
   const [status, setStatus] = (0, import_react33.useState)(fallback);
+  const [hubs, setHubs] = (0, import_react33.useState)([]);
+  const [scanning, setScanning] = (0, import_react33.useState)(false);
+  const [scanned, setScanned] = (0, import_react33.useState)(false);
   const [pairing, setPairing] = (0, import_react33.useState)(null);
+  const [advanced, setAdvanced] = (0, import_react33.useState)(false);
+  const [manual, setManual] = (0, import_react33.useState)("");
   const [busy, setBusy] = (0, import_react33.useState)(false);
   const [confirming, setConfirming] = (0, import_react33.useState)("");
   (0, import_react33.useEffect)(() => {
@@ -14807,8 +14894,23 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
   const enabled = status.enabled === true;
   const available = status.available !== false;
   const hub = status.hub ?? { state: "off" };
+  const node = status.node ?? { paired: false, state: "unpaired" };
   const nodes = status.nodes ?? [];
-  const policy = status.policy ?? [];
+  const requests = status.requests ?? [];
+  const joining = node.joining;
+  const scan = (0, import_react33.useCallback)(() => {
+    if (typeof actions.multiDeviceScan !== "function") return;
+    setScanning(true);
+    void run2(Promise.resolve().then(() => actions.multiDeviceScan()).then((value) => {
+      setHubs(value?.hubs ?? []);
+    })).finally(() => setScanning(false));
+  }, [actions, run2]);
+  (0, import_react33.useEffect)(() => {
+    if (scanned || !available || enabled || node.paired || typeof actions.multiDeviceScan !== "function") return void 0;
+    setScanned(true);
+    scan();
+    return void 0;
+  }, [scanned, available, enabled, node.paired, actions, scan]);
   const toggle = (on) => {
     if (busy) return;
     setBusy(true);
@@ -14816,6 +14918,20 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
     void run2(actions.multiDeviceSetEnabled(on)).then((ok) => {
       if (ok) refresh();
     }).finally(() => setBusy(false));
+  };
+  const join = (url) => {
+    if (busy || url === "") return;
+    setBusy(true);
+    void run2(Promise.resolve().then(() => actions.multiDeviceJoin(url)).then((value) => {
+      if (value) setStatus(value);
+    })).finally(() => setBusy(false));
+  };
+  const leave = () => {
+    if (busy) return;
+    setBusy(true);
+    void run2(Promise.resolve().then(() => actions.multiDeviceLeave()).then((value) => {
+      if (value) setStatus(value);
+    })).finally(() => setBusy(false));
   };
   const addMachine = () => {
     if (busy) return;
@@ -14825,112 +14941,130 @@ function DevicesPage({ roster, actions, run: run2, Section: Section2, Row: Row4,
       return value;
     })).finally(() => setBusy(false));
   };
-  const remove = (node) => {
+  const remove = (entry) => {
     if (busy) return;
-    if (confirming !== node.id) {
-      setConfirming(node.id);
+    if (confirming !== entry.id) {
+      setConfirming(entry.id);
       return;
     }
     setConfirming("");
     setBusy(true);
-    void run2(Promise.resolve().then(() => actions.multiDeviceRemove(node.id)).then((value) => {
+    void run2(Promise.resolve().then(() => actions.multiDeviceRemove(entry.id)).then((value) => {
       if (value) setStatus(value);
     })).finally(() => setBusy(false));
   };
-  const hubUrl = typeof hub.url === "string" && hub.url !== "" ? hub.url : void 0;
-  const hubHint = hub.localUrl === void 0 ? void 0 : t("On this computer: {url}", { url: hub.localUrl });
+  const answer = (request, allow) => {
+    if (busy) return;
+    setBusy(true);
+    const call2 = allow ? actions.multiDeviceApprove : actions.multiDeviceDeny;
+    void run2(Promise.resolve().then(() => call2(request.id)).then((value) => {
+      if (value) setStatus(value);
+    })).finally(() => setBusy(false));
+  };
+  if (!available) {
+    return [(0, import_react33.createElement)(
+      Section2,
+      { key: "off", title: t("Multi-device") },
+      (0, import_react33.createElement)(Row4, { label: t("This computer is set up without multi-device (multiDevice: false).") })
+    )];
+  }
+  if (node.paired) {
+    const name = node.hubName ?? hostOf2(node.hubUrl);
+    return [(0, import_react33.createElement)(
+      Section2,
+      { key: "node", title: t("This computer") },
+      (0, import_react33.createElement)(Row4, {
+        label: t("Joined {name}", { name }),
+        hint: node.error ?? (node.online ? t("Online") : t("Offline"))
+      }, (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: leave }, t("Leave")))
+    )];
+  }
+  if (joining !== void 0) {
+    return [(0, import_react33.createElement)(
+      Section2,
+      { key: "joining", title: t("This computer") },
+      (0, import_react33.createElement)(
+        Row4,
+        { label: t("Waiting for {name} to allow this computer…", { name: joining.hub ?? hostOf2(joining.url) }) },
+        (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: leave }, t("Cancel"))
+      ),
+      node.error === void 0 ? null : (0, import_react33.createElement)(Row4, { label: node.error })
+    )];
+  }
+  const hubSection = (0, import_react33.createElement)(
+    Section2,
+    { key: "devices", title: t("Devices · {count}", { count: nodes.length }) },
+    requests.map((request) => (0, import_react33.createElement)(RequestRow, {
+      key: request.id,
+      request,
+      busy,
+      onAllow: (entry) => answer(entry, true),
+      onDeny: (entry) => answer(entry, false)
+    })),
+    nodes.length === 0 ? (0, import_react33.createElement)(Row4, { label: requests.length === 0 ? t("No device yet.") : t("Allow the machine above to add it.") }) : nodes.map((entry) => (0, import_react33.createElement)(NodeRow, {
+      key: entry.id,
+      node: entry,
+      confirming: confirming === entry.id,
+      busy,
+      onRemove: () => remove(entry)
+    })),
+    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("On the other computer, open Settings → Devices and pick this one under Nearby hubs.")),
+    (0, import_react33.createElement)(
+      "div",
+      { className: "bt-actions" },
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: () => setAdvanced((value) => !value) }, t("Advanced"))
+    ),
+    advanced ? (0, import_react33.createElement)(
+      "div",
+      { className: "bt-actions" },
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy || hub.state !== "listening", onClick: addMachine }, t("Pairing code"))
+    ) : null,
+    pairing === null ? null : (0, import_react33.createElement)(CommandPanel, { pairing, daemon: status.daemon, onClose: () => setPairing(null) }),
+    confirming ? (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("{name} must pair again before it can be used. Its running task is cancelled; stop the worker on that machine as well.", { name: nodes.find((entry) => entry.id === confirming)?.name ?? t("The machine") })) : null
+  );
+  const nearbySection = (0, import_react33.createElement)(
+    Section2,
+    { key: "nearby", title: t("Nearby hubs") },
+    (0, import_react33.createElement)(Nearby, { hubs, scanning, busy, onScan: scan, onJoin: join }),
+    (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("On the other computer, turn on multi-device in Settings → Devices.")),
+    (0, import_react33.createElement)(
+      "div",
+      { className: "bt-actions" },
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy, onClick: () => setAdvanced((value) => !value) }, t("Advanced"))
+    ),
+    advanced ? (0, import_react33.createElement)(
+      "div",
+      { className: "bt-dev-row" },
+      (0, import_react33.createElement)("input", {
+        type: "text",
+        className: "bt-dev-input",
+        value: manual,
+        placeholder: "http://192.168.1.23:8787",
+        onChange: (event) => setManual(event.target.value)
+      }),
+      (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy || manual.trim() === "", onClick: () => join(manual.trim()) }, t("Join"))
+    ) : null
+  );
   return [
     (0, import_react33.createElement)(
       Section2,
-      { key: "switch", title: t("Multi-device") },
+      { key: "switch", title: t("This computer") },
       (0, import_react33.createElement)(Row4, {
-        label: t("Enable multi-device on this computer"),
-        hint: t("Other machines run read-only commands directly; other commands and file writes ask you first. This computer is the hub.")
-      }, Switch2 === void 0 ? null : (0, import_react33.createElement)(Switch2, { label: t("Enable multi-device on this computer"), on: enabled, disabled: !available || busy, onChange: toggle })),
-      !available ? (0, import_react33.createElement)(Row4, { label: t("This computer is set up without multi-device (multiDevice: false).") }) : null
-    ),
-    enabled ? (0, import_react33.createElement)(
-      Section2,
-      { key: "hub", title: t("This computer") },
-      (0, import_react33.createElement)(Row4, {
+        label: t("Let this computer be the hub"),
+        hint: t("Bots here can reach the machines that join it.")
+      }, Switch2 === void 0 ? null : (0, import_react33.createElement)(Switch2, { label: t("Let this computer be the hub"), on: enabled, disabled: busy, onChange: toggle })),
+      enabled ? (0, import_react33.createElement)(Row4, {
         label: t(STATE_LABEL[hub.state] ?? STATE_LABEL.failed),
-        hint: hub.error ?? hubHint
-      }, hubUrl === void 0 ? null : (0, import_react33.createElement)(
+        hint: hub.error
+      }, hub.url === void 0 ? null : (0, import_react33.createElement)(
         "div",
         { className: "bt-dev-url" },
-        (0, import_react33.createElement)("code", null, hubUrl),
-        (0, import_react33.createElement)(CopyButton2, { text: hubUrl })
-      )),
-      status.sync == null ? null : (0, import_react33.createElement)(Row4, {
-        label: t("Paired machines follow this conversation through the hub, not a browser."),
-        hint: t("Revision {revision}. A message here reaches them in about a second.", { revision: status.sync.revision })
-      }),
-      hub.webUrl === void 0 ? (0, import_react33.createElement)(Row4, {
-        label: t("Shared chat"),
-        hint: t("This DSH does not report a Web address. Start DSH Web on this computer, then reopen this page.")
-      }) : (0, import_react33.createElement)(
-        Row4,
-        {
-          label: t("Shared chat"),
-          hint: sharedSessionLink(hub.webUrl).kind === "forward" ? t("This DSH Web listens on 127.0.0.1 only. On the other machine, forward the port first, then open this address.") : t("Other machines open this address in a browser to see the same conversation.")
-        },
-        (0, import_react33.createElement)(
-          "div",
-          { className: "bt-dev-url" },
-          (0, import_react33.createElement)("code", null, hub.webUrl),
-          (0, import_react33.createElement)(CopyButton2, { text: hub.webUrl, label: "Copy address" })
-        ),
-        sharedSessionLink(hub.webUrl).kind === "forward" ? (0, import_react33.createElement)(
-          "div",
-          { className: "bt-dev-command" },
-          (0, import_react33.createElement)("code", null, sharedSessionLink(hub.webUrl).command),
-          (0, import_react33.createElement)(CopyButton2, { text: sharedSessionLink(hub.webUrl).command, label: "Copy command" })
-        ) : null
-      ),
-      hub.webUrl === void 0 ? null : (0, import_react33.createElement)(Row4, {
-        label: t("The login link DSH printed when it started is the credential; this address only opens the page.")
-      })
-    ) : null,
-    enabled ? (0, import_react33.createElement)(
-      Section2,
-      { key: "machines", title: t("Machines · {count}", { count: nodes.length }) },
-      nodes.length === 0 ? (0, import_react33.createElement)(Row4, { label: t("No machine is paired yet."), hint: t("Add one to let the Bots here run commands on it.") }) : nodes.map((node) => (0, import_react33.createElement)(NodeRow, {
-        key: node.id,
-        node,
-        confirming: confirming === node.id,
-        busy,
-        onRemove: () => remove(node)
-      })),
-      (0, import_react33.createElement)(
-        "div",
-        { className: "bt-actions" },
-        (0, import_react33.createElement)("button", { type: "button", className: "bt-soft bt-soft-sm", disabled: busy || hub.state !== "listening", onClick: addMachine }, t("Add machine"))
-      ),
-      confirming ? (0, import_react33.createElement)("div", { className: "bt-dev-hint" }, t("{name} must pair again before it can be used. Its running task is cancelled; stop the worker on that machine as well.", { name: nodes.find((node) => node.id === confirming)?.name ?? t("The machine") })) : null,
-      pairing === null ? null : (0, import_react33.createElement)(PairingPanel, { pairing, onClose: () => setPairing(null) })
-    ) : null,
-    enabled ? (0, import_react33.createElement)(
-      Section2,
-      { key: "daemon", title: t("Run it all the time") },
-      (0, import_react33.createElement)(Row4, {
-        label: t("Keep the worker running on another machine"),
-        hint: t("Pair that machine once, then run this in the ds-bot folder there. It starts at login and keeps reconnecting after a drop.")
-      }, status.daemon?.command === void 0 ? null : (0, import_react33.createElement)(
-        "div",
-        { className: "bt-dev-command" },
-        (0, import_react33.createElement)("code", null, status.daemon.command),
-        (0, import_react33.createElement)(CopyButton2, { text: status.daemon.command, label: "Copy command" })
-      )),
-      (0, import_react33.createElement)(Row4, { label: t("The command carries no pairing code: the device token stays in device.json on that machine.") })
-    ) : null,
-    (0, import_react33.createElement)(
-      Section2,
-      { key: "about", title: t("How it works") },
-      (0, import_react33.createElement)(Row4, { label: t("One hub only. This computer is the hub: the Bots here decide which machine runs a command.") }),
-      (0, import_react33.createElement)(Row4, { label: t("Other machines follow the same conversation through the hub. A browser can still open this computer's DS Bot page for the full interface.") }),
-      (0, import_react33.createElement)(Row4, { label: t("To move the hub to another computer, turn multi-device on there and pair the machines again.") }),
-      policy.length === 0 ? null : (0, import_react33.createElement)(Row4, { label: t("Machines run read-only commands directly: {commands}. Anything else asks you first.", { commands: policy.join(", ") }) })
-    )
+        (0, import_react33.createElement)("code", null, hub.url),
+        (0, import_react33.createElement)(CopyButton2, { text: hub.url })
+      )) : null,
+      node.error === void 0 ? null : (0, import_react33.createElement)(Row4, { label: node.error })
+    ),
+    enabled ? hubSection : nearbySection
   ];
 }
 var DEVICES_CSS = `
@@ -14953,6 +15087,8 @@ var DEVICES_CSS = `
 .bt-dev-hint{font-size:12px;line-height:17px;color:var(--bt-ink-2)}
 .bt-dev-command{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bt-card);border:.5px solid var(--bt-line);min-width:0}
 .bt-dev-command code{flex:1}
+.bt-dev-row{display:flex;align-items:center;gap:8px;padding:8px 14px}
+.bt-dev-input{flex:1;min-width:0;padding:6px 8px;border-radius:8px;border:.5px solid var(--bt-line);background:var(--bt-card);color:var(--bt-ink);font:inherit;font-size:12px}
 .bt-dev-strip{display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:6px 10px;margin:0 0 4px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);font:inherit;font-size:12px;text-align:left;cursor:pointer}
 .bt-dev-strip:hover{background:var(--bt-hover)}
 .bt-dev-strip-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -24256,7 +24392,7 @@ function transcriptOf(list, id, name, hiddenTurns = []) {
   return lines.join("\n\n");
 }
 var TAB_LABELS = { details: "Details", browser: "Browser", computer: "Computer" };
-var hostOf2 = (url) => {
+var hostOf3 = (url) => {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
   } catch {
@@ -24358,7 +24494,7 @@ function BrowserCards({ bot, sessionId, roster, actions, useBrowserTabs, useBrow
           { className: "bt-bcard-row" },
           (0, import_react58.createElement)(Favicon, { src: page.favicon, className: "bt-bcard-fav" }),
           (0, import_react58.createElement)("span", { className: "bt-bcard-title" }, label),
-          page.url ? (0, import_react58.createElement)("span", { className: "bt-bcard-host" }, hostOf2(page.url)) : null
+          page.url ? (0, import_react58.createElement)("span", { className: "bt-bcard-host" }, hostOf3(page.url)) : null
         )
       );
     }),

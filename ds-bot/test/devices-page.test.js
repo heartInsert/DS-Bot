@@ -6,7 +6,7 @@ import { build } from 'esbuild'
 
 const { outputFiles } = await build({
   stdin: {
-    contents: "export { DevicesPage, NodeRow, DevicesStrip, deviceSummary, sharedSessionLink } from './src/client/devices-page.js'",
+    contents: "export { DevicesPage, NodeRow, Nearby, DevicesStrip, deviceSummary, sharedSessionLink } from './src/client/devices-page.js'",
     resolveDir: fileURLToPath(new URL('..', import.meta.url)),
   },
   bundle: true, format: 'cjs', platform: 'browser', write: false, logLevel: 'silent',
@@ -39,7 +39,7 @@ runInNewContext(outputFiles[0].text, {
   navigator: { clipboard: { writeText: async text => { copied.push(text) } } },
   URL,
 }, { filename: 'bundle.cjs' })
-const { DevicesPage, NodeRow, DevicesStrip, deviceSummary, sharedSessionLink } = module.exports
+const { DevicesPage, NodeRow, Nearby, DevicesStrip, deviceSummary, sharedSessionLink } = module.exports
 
 function render(component, props) {
   current = { index: 0, slots: [], effects: [] }
@@ -52,6 +52,9 @@ const texts = (node, found = []) => {
   if (typeof node === 'string' || typeof node === 'number') found.push(String(node))
   if (Array.isArray(node)) node.forEach(item => texts(item, found))
   if (node && typeof node === 'object') {
+    // The page leaves child components as elements; rendering one here is what a
+    // browser would do before its text is read.
+    if (typeof node.type === 'function') return texts(node.type(node.props), found)
     for (const key of ['children', 'label', 'title', 'hint']) if (node.props?.[key]) texts(node.props[key], found)
   }
   return found
@@ -60,34 +63,58 @@ const buttons = (node, found = []) => {
   if (Array.isArray(node)) node.forEach(item => buttons(item, found))
   if (node && typeof node === 'object') {
     if (node.type === 'button') found.push(texts(node).join(''))
+    if (typeof node.type === 'function') return buttons(node.type(node.props), found)
     for (const key of ['children', 'label', 'title']) if (node.props?.[key]) buttons(node.props[key], found)
   }
   return found
 }
+const findButton = (node, label) => {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findButton(item, label)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  if (node && typeof node === 'object') {
+    if (node.type === 'button' && texts(node).join('') === label) return node
+    if (typeof node.type === 'function') return findButton(node.type(node.props), label)
+    for (const key of ['children', 'label', 'title']) {
+      const found = node.props?.[key] === undefined ? undefined : findButton(node.props[key], label)
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
 
-const Frame = ({ children }) => ({ type: 'row', props: { children } })
+const Frame = ({ label, title, hint, children }) => ({ type: 'row', props: { label, title, hint, children } })
 const Switch = ({ label }) => ({ type: 'switch', props: { label } })
+const page = (roster, actions = {}) => render(DevicesPage, { roster, actions, run: promise => promise, Section: Frame, Row: Frame, Switch })
 
-test('the Devices page shows the switch, the hub address and each machine', () => {
+test('the hub page shows the machines, who waits to join, and no command line', () => {
   const roster = {
     multiDevice: {
       available: true,
       enabled: true,
       hub: { state: 'listening', url: 'http://192.168.1.5:8787', localUrl: 'http://127.0.0.1:8787' },
       nodes: [{ id: 'nd_1', name: 'win-pc', hostname: 'WIN-PC', os: 'win32', arch: 'x64', online: true }],
-      policy: ['hostname', 'whoami', 'uname', 'echo (built in)'],
+      requests: [{ id: 'jr_1', name: 'pc2', hostname: 'PC2', os: 'win32', status: 'pending' }],
+      policy: ['hostname', 'whoami'],
       daemon: { command: 'npm run lan:daemon -- install --hub http://192.168.1.5:8787 --name other-pc' },
     },
   }
-  const tree = render(DevicesPage, { roster, actions: {}, run: promise => promise, Section: Frame, Row: Frame, Switch })
+  const tree = page(roster)
   const found = texts(tree)
-  assert.ok(found.includes('Enable multi-device on this computer'))
+  assert.ok(found.includes('Let this computer be the hub'))
   assert.ok(found.includes('Listening'))
   assert.ok(found.includes('http://192.168.1.5:8787'))
-  assert.ok(found.includes('Machines · 1'))
-  assert.ok(found.includes('Machines run read-only commands directly: hostname, whoami, uname, echo (built in). Anything else asks you first.'))
-  assert.ok(found.includes('npm run lan:daemon -- install --hub http://192.168.1.5:8787 --name other-pc'))
-  assert.ok(buttons(tree).includes('Add machine'))
+  assert.ok(found.includes('Devices · 1'))
+  assert.ok(found.includes('pc2 wants to join'))
+  assert.ok(found.includes('On the other computer, open Settings → Devices and pick this one under Nearby hubs.'))
+  assert.deepEqual(buttons(tree).sort(), ['Advanced', 'Allow', 'Copy', 'Deny', 'Remove'])
+  // The command line lives behind Advanced and is not on the main path.
+  assert.equal(found.some(text => text.includes('npm run lan:worker')), false)
+  assert.equal(found.includes('Pairing code'), false)
 
   const row = render(NodeRow, { node: roster.multiDevice.nodes[0], confirming: false, busy: false, onRemove: () => {} })
   assert.ok(texts(row).includes('win-pc'))
@@ -96,12 +123,74 @@ test('the Devices page shows the switch, the hub address and each machine', () =
   assert.ok(buttons(row).includes('Remove'))
 })
 
-test('the Devices page keeps the switch and the add button out when multi-device is off', () => {
-  const roster = { multiDevice: { available: false, enabled: false, hub: { state: 'off' }, nodes: [], policy: [] } }
-  const tree = render(DevicesPage, { roster, actions: {}, run: promise => promise, Section: Frame, Row: Frame, Switch })
+test('the hub page shows that no machine has joined yet', () => {
+  const tree = page({ multiDevice: { available: true, enabled: true, hub: { state: 'listening', url: 'http://192.168.1.5:8787' }, nodes: [], requests: [] } })
+  assert.ok(texts(tree).includes('No device yet.'))
+})
+
+test('a machine that has joined shows one line and a way out', () => {
+  const tree = page({
+    multiDevice: {
+      available: true,
+      enabled: false,
+      hub: { state: 'off' },
+      nodes: [],
+      node: { paired: true, hubName: 'Mac mini', hubUrl: 'http://192.168.1.5:8787', online: true, state: 'online' },
+    },
+  })
   const found = texts(tree)
-  assert.ok(found.includes('This computer is set up without multi-device (multiDevice: false).'))
-  assert.equal(buttons(tree).includes('Add machine'), false)
+  assert.ok(found.includes('Joined Mac mini'))
+  assert.ok(found.includes('Online'))
+  assert.deepEqual(buttons(tree), ['Leave'])
+  assert.equal(found.includes('Let this computer be the hub'), false)
+  assert.equal(found.includes('Nearby hubs'), false)
+})
+
+test('a machine asking to join says which hub it waits for', () => {
+  const tree = page({
+    multiDevice: {
+      available: true,
+      enabled: false,
+      hub: { state: 'off' },
+      nodes: [],
+      node: { paired: false, state: 'unpaired', joining: { state: 'waiting', url: 'http://192.168.1.5:8787', hub: 'Mac mini' } },
+    },
+  })
+  assert.ok(texts(tree).includes('Waiting for Mac mini to allow this computer…'))
+  assert.deepEqual(buttons(tree), ['Cancel'])
+})
+
+test('the page looks for hubs when this computer is not one', () => {
+  const tree = page({ multiDevice: { available: true, enabled: false, hub: { state: 'off' }, nodes: [], requests: [], node: { paired: false } } })
+  const found = texts(tree)
+  assert.ok(found.includes('Nearby hubs'))
+  assert.ok(found.includes('No hub found. Check that both computers are on the same Wi-Fi.'))
+  assert.ok(found.includes('On the other computer, turn on multi-device in Settings → Devices.'))
+  assert.deepEqual(buttons(tree).sort(), ['Advanced', 'Search again'])
+  assert.equal(found.includes('Let this computer be the hub'), true)
+})
+
+test('a nearby hub is one row with a join button', () => {
+  const joined = []
+  const tree = render(Nearby, {
+    hubs: [{ id: 'hub_a', name: 'Mac mini', url: 'http://192.168.1.5:8787' }],
+    scanning: false,
+    busy: false,
+    onScan: () => {},
+    onJoin: url => joined.push(url),
+  })
+  assert.ok(texts(tree).includes('Mac mini'))
+  assert.ok(texts(tree).includes('http://192.168.1.5:8787'))
+  const join = findButton(tree, 'Join')
+  join.props.onClick()
+  assert.deepEqual(joined, ['http://192.168.1.5:8787'])
+  assert.ok(texts(render(Nearby, { hubs: [], scanning: true, busy: false, onScan: () => {}, onJoin: () => {} })).includes('Searching…'))
+})
+
+test('the Devices page keeps the switch out when the profile forbids multi-device', () => {
+  const tree = page({ multiDevice: { available: false, enabled: false, hub: { state: 'off' }, nodes: [], policy: [] } })
+  assert.ok(texts(tree).includes('This computer is set up without multi-device (multiDevice: false).'))
+  assert.deepEqual(buttons(tree), [])
 })
 
 test('the sidebar strip shows how many paired machines are online and opens Devices', () => {
@@ -150,36 +239,6 @@ test('a session link is direct on the LAN and a port forward on loopback', () =>
   assert.equal(sharedSessionLink('').kind, 'none')
   assert.equal(sharedSessionLink('not a url').kind, 'none')
   assert.equal(sharedSessionLink(undefined).kind, 'none')
-})
-
-test('the Devices page shows the shared address, or a port forward for a loopback server', () => {
-  const base = {
-    available: true,
-    enabled: true,
-    hub: { state: 'listening', url: 'http://192.168.1.5:8787' },
-    nodes: [],
-    policy: [],
-  }
-  const remote = render(DevicesPage, {
-    roster: { multiDevice: { ...base, hub: { ...base.hub, webUrl: 'http://192.168.1.5:3080' } } },
-    actions: {}, run: promise => promise, Section: Frame, Row: Frame, Switch,
-  })
-  assert.ok(texts(remote).includes('Other machines open this address in a browser to see the same conversation.'))
-  assert.ok(texts(remote).includes('http://192.168.1.5:3080'))
-
-  const local = render(DevicesPage, {
-    roster: { multiDevice: { ...base, hub: { ...base.hub, webUrl: 'http://127.0.0.1:3080' } } },
-    actions: {}, run: promise => promise, Section: Frame, Row: Frame, Switch,
-  })
-  assert.ok(texts(local).includes('This DSH Web listens on 127.0.0.1 only. On the other machine, forward the port first, then open this address.'))
-  assert.ok(texts(local).includes('ssh -L 3080:127.0.0.1:3080 <user>@<this-machine>'))
-
-  const none = render(DevicesPage, {
-    roster: { multiDevice: base },
-    actions: {}, run: promise => promise, Section: Frame, Row: Frame, Switch,
-  })
-  assert.ok(texts(none).includes('This DSH does not report a Web address. Start DSH Web on this computer, then reopen this page.'))
-  assert.equal(texts(none).includes('Other machines open this address in a browser to see the same conversation.'), false)
 })
 
 test('the sidebar strip copies the shared address', async () => {

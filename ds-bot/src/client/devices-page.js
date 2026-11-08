@@ -2,9 +2,9 @@ import { createElement as h, useCallback, useEffect, useState } from 'react'
 import { DevicesIcon } from './icons.js'
 import { dateLocale, t } from './i18n.js'
 
-// Settings → Devices: the LAN multi-device switch, the hub this computer runs, the
-// machines paired with it, and one-use pairing codes. The page polls while it is open
-// so a worker that comes online shows up without reopening Settings.
+// Settings → Devices: turn this computer into the hub, let the machines paired with it
+// in, or join a hub that is already on this network. The page polls while it is open so
+// a machine that joins, drops or asks to join shows up without reopening Settings.
 const POLL_MS = 3000
 
 const STATE_LABEL = { off: 'Off', starting: 'Starting…', listening: 'Listening', failed: 'Could not start' }
@@ -13,6 +13,14 @@ function timeText(value) {
   if (typeof value !== 'string' || value === '') return t('Never seen')
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString(dateLocale(), { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host
+  } catch {
+    return String(url ?? '')
+  }
 }
 
 function CopyButton({ text, label = 'Copy' }) {
@@ -50,19 +58,15 @@ export function NodeRow({ node, confirming, busy, onRemove }) {
     }, confirming ? t('Click again to remove') : t('Remove')))
 }
 
-function PairingPanel({ pairing, onClose }) {
-  return h('div', { className: 'bt-dev-pairing' },
-    h('div', { className: 'bt-dev-pairing-head' },
-      h('span', { className: 'bt-dev-pairing-label' }, t('Pairing code')),
-      h('code', { className: 'bt-dev-code' }, pairing.code)),
-    h('div', { className: 'bt-dev-hint' }, t('Valid until {time}. One machine, one use.', { time: timeText(pairing.expiresAt) })),
-    h('div', { className: 'bt-dev-hint' }, t('Run this in the ds-bot folder on the other machine:')),
-    h('div', { className: 'bt-dev-command' },
-      h('code', null, pairing.command),
-      h(CopyButton, { text: pairing.command, label: 'Copy command' })),
-    h('div', { className: 'bt-dev-hint' }, t('Replace other-pc with that machine\'s name. The same command works in PowerShell and in the macOS Terminal.')),
-    h('div', { className: 'bt-actions' },
-      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: onClose }, t('Done'))))
+function RequestRow({ request, busy, onAllow, onDeny }) {
+  const meta = [request.hostname, request.os].filter(Boolean).join(' · ')
+  return h('div', { className: 'bt-dev-node' },
+    h('span', { className: 'bt-dev-dot', 'aria-hidden': true }),
+    h('span', { className: 'bt-dev-node-copy' },
+      h('span', { className: 'bt-dev-node-name' }, t('{name} wants to join', { name: request.name })),
+      meta === '' ? null : h('span', { className: 'bt-dev-node-meta' }, meta)),
+    h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: () => onAllow(request) }, t('Allow')),
+    h('button', { type: 'button', className: 'bt-soft bt-soft-sm bt-dev-remove', disabled: busy, onClick: () => onDeny(request) }, t('Deny')))
 }
 
 // Where another machine opens the same conversation. The Web server reports only its
@@ -158,10 +162,49 @@ function LinkIcon() {
     h('path', { d: 'M6.5 9.5l3-3M7 4.5l1-1a2.8 2.8 0 014 4l-1 1M9 11.5l-1 1a2.8 2.8 0 01-4-4l1-1' }))
 }
 
+// The pairing code and the command line stay for a machine whose page cannot reach this
+// hub (a firewall that drops the probe) and for a hub without a screen to press.
+function CommandPanel({ pairing, daemon, onClose }) {
+  return h('div', { className: 'bt-dev-pairing' },
+    h('div', { className: 'bt-dev-pairing-head' },
+      h('span', { className: 'bt-dev-pairing-label' }, t('Pairing code for the command line')),
+      h('code', { className: 'bt-dev-code' }, pairing.code)),
+    h('div', { className: 'bt-dev-hint' }, t('Valid until {time}. One machine, one use.', { time: timeText(pairing.expiresAt) })),
+    h('div', { className: 'bt-dev-command' },
+      h('code', null, pairing.command),
+      h(CopyButton, { text: pairing.command, label: 'Copy command' })),
+    daemon?.command === undefined ? null : h('div', { className: 'bt-dev-command' },
+      h('code', null, daemon.command),
+      h(CopyButton, { text: daemon.command, label: 'Copy command' })),
+    h('div', { className: 'bt-actions' },
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', onClick: onClose }, t('Done'))))
+}
+
+export function Nearby({ hubs, scanning, busy, onScan, onJoin }) {
+  if (scanning) return h('div', { className: 'bt-dev-hint' }, t('Searching…'))
+  if (hubs.length === 0) {
+    return h('div', { className: 'bt-dev-hint' },
+      t('No hub found. Check that both computers are on the same Wi-Fi.'),
+      h('div', { className: 'bt-actions' },
+        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: onScan }, t('Search again'))))
+  }
+  return hubs.map(hub => h('div', { key: hub.id ?? hub.url, className: 'bt-dev-node' },
+    h('span', { className: 'bt-dev-dot', 'aria-hidden': true }),
+    h('span', { className: 'bt-dev-node-copy' },
+      h('span', { className: 'bt-dev-node-name' }, hub.name),
+      h('span', { className: 'bt-dev-node-meta' }, hub.url)),
+    h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: () => onJoin(hub.url) }, t('Join'))))
+}
+
 export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
   const fallback = roster.multiDevice ?? { available: true, enabled: false, hub: { state: 'off' }, nodes: [], policy: [] }
   const [status, setStatus] = useState(fallback)
+  const [hubs, setHubs] = useState([])
+  const [scanning, setScanning] = useState(false)
+  const [scanned, setScanned] = useState(false)
   const [pairing, setPairing] = useState(null)
+  const [advanced, setAdvanced] = useState(false)
+  const [manual, setManual] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirming, setConfirming] = useState('')
 
@@ -185,8 +228,29 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
   const enabled = status.enabled === true
   const available = status.available !== false
   const hub = status.hub ?? { state: 'off' }
+  const node = status.node ?? { paired: false, state: 'unpaired' }
   const nodes = status.nodes ?? []
-  const policy = status.policy ?? []
+  const requests = status.requests ?? []
+  const joining = node.joining
+
+  const scan = useCallback(() => {
+    if (typeof actions.multiDeviceScan !== 'function') return
+    setScanning(true)
+    void run(Promise.resolve()
+      .then(() => actions.multiDeviceScan())
+      .then(value => { setHubs(value?.hubs ?? []) }))
+      .finally(() => setScanning(false))
+  }, [actions, run])
+
+  // A page that is only a node, or a hub that is off, looks around once when it opens:
+  // that hub is the answer the other machine is looking for. Later checks are the
+  // Search again button, so a poll never turns into a scan loop.
+  useEffect(() => {
+    if (scanned || !available || enabled || node.paired || typeof actions.multiDeviceScan !== 'function') return undefined
+    setScanned(true)
+    scan()
+    return undefined
+  }, [scanned, available, enabled, node.paired, actions, scan])
 
   const toggle = (on) => {
     if (busy) return
@@ -194,6 +258,24 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
     setPairing(null)
     void run(actions.multiDeviceSetEnabled(on))
       .then(ok => { if (ok) refresh() })
+      .finally(() => setBusy(false))
+  }
+
+  const join = (url) => {
+    if (busy || url === '') return
+    setBusy(true)
+    void run(Promise.resolve()
+      .then(() => actions.multiDeviceJoin(url))
+      .then(value => { if (value) setStatus(value) }))
+      .finally(() => setBusy(false))
+  }
+
+  const leave = () => {
+    if (busy) return
+    setBusy(true)
+    void run(Promise.resolve()
+      .then(() => actions.multiDeviceLeave())
+      .then(value => { if (value) setStatus(value) }))
       .finally(() => setBusy(false))
   }
 
@@ -206,86 +288,103 @@ export function DevicesPage({ roster, actions, run, Section, Row, Switch }) {
       .finally(() => setBusy(false))
   }
 
-  const remove = (node) => {
+  const remove = (entry) => {
     if (busy) return
-    if (confirming !== node.id) { setConfirming(node.id); return }
+    if (confirming !== entry.id) { setConfirming(entry.id); return }
     setConfirming('')
     setBusy(true)
     void run(Promise.resolve()
-      .then(() => actions.multiDeviceRemove(node.id))
+      .then(() => actions.multiDeviceRemove(entry.id))
       .then(value => { if (value) setStatus(value) }))
       .finally(() => setBusy(false))
   }
 
-  const hubUrl = typeof hub.url === 'string' && hub.url !== '' ? hub.url : undefined
-  const hubHint = hub.localUrl === undefined ? undefined : t('On this computer: {url}', { url: hub.localUrl })
+  const answer = (request, allow) => {
+    if (busy) return
+    setBusy(true)
+    const call = allow ? actions.multiDeviceApprove : actions.multiDeviceDeny
+    void run(Promise.resolve()
+      .then(() => call(request.id))
+      .then(value => { if (value) setStatus(value) }))
+      .finally(() => setBusy(false))
+  }
+
+  if (!available) {
+    return [h(Section, { key: 'off', title: t('Multi-device') },
+      h(Row, { label: t('This computer is set up without multi-device (multiDevice: false).') }))]
+  }
+
+  // A computer that joined a hub shows that one line; it does not run a second hub.
+  if (node.paired) {
+    const name = node.hubName ?? hostOf(node.hubUrl)
+    return [h(Section, { key: 'node', title: t('This computer') },
+      h(Row, {
+        label: t('Joined {name}', { name }),
+        hint: node.error ?? (node.online ? t('Online') : t('Offline')),
+      }, h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: leave }, t('Leave'))))]
+  }
+
+  if (joining !== undefined) {
+    return [h(Section, { key: 'joining', title: t('This computer') },
+      h(Row, { label: t('Waiting for {name} to allow this computer…', { name: joining.hub ?? hostOf(joining.url) }) },
+        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: leave }, t('Cancel'))),
+      node.error === undefined ? null : h(Row, { label: node.error }))]
+  }
+
+  const hubSection = h(Section, { key: 'devices', title: t('Devices · {count}', { count: nodes.length }) },
+    requests.map(request => h(RequestRow, {
+      key: request.id,
+      request,
+      busy,
+      onAllow: entry => answer(entry, true),
+      onDeny: entry => answer(entry, false),
+    })),
+    nodes.length === 0
+      ? h(Row, { label: requests.length === 0 ? t('No device yet.') : t('Allow the machine above to add it.') })
+      : nodes.map(entry => h(NodeRow, {
+        key: entry.id,
+        node: entry,
+        confirming: confirming === entry.id,
+        busy,
+        onRemove: () => remove(entry),
+      })),
+    h('div', { className: 'bt-dev-hint' }, t('On the other computer, open Settings → Devices and pick this one under Nearby hubs.')),
+    h('div', { className: 'bt-actions' },
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: () => setAdvanced(value => !value) }, t('Advanced'))),
+    advanced ? h('div', { className: 'bt-actions' },
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy || hub.state !== 'listening', onClick: addMachine }, t('Pairing code'))) : null,
+    pairing === null ? null : h(CommandPanel, { pairing, daemon: status.daemon, onClose: () => setPairing(null) }),
+    confirming ? h('div', { className: 'bt-dev-hint' }, t('{name} must pair again before it can be used. Its running task is cancelled; stop the worker on that machine as well.', { name: nodes.find(entry => entry.id === confirming)?.name ?? t('The machine') })) : null)
+
+  const nearbySection = h(Section, { key: 'nearby', title: t('Nearby hubs') },
+    h(Nearby, { hubs, scanning, busy, onScan: scan, onJoin: join }),
+    h('div', { className: 'bt-dev-hint' }, t('On the other computer, turn on multi-device in Settings → Devices.')),
+    h('div', { className: 'bt-actions' },
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy, onClick: () => setAdvanced(value => !value) }, t('Advanced'))),
+    advanced ? h('div', { className: 'bt-dev-row' },
+      h('input', {
+        type: 'text',
+        className: 'bt-dev-input',
+        value: manual,
+        placeholder: 'http://192.168.1.23:8787',
+        onChange: event => setManual(event.target.value),
+      }),
+      h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy || manual.trim() === '', onClick: () => join(manual.trim()) }, t('Join'))) : null)
 
   return [
-    h(Section, { key: 'switch', title: t('Multi-device') },
+    h(Section, { key: 'switch', title: t('This computer') },
       h(Row, {
-        label: t('Enable multi-device on this computer'),
-        hint: t('Other machines run read-only commands directly; other commands and file writes ask you first. This computer is the hub.'),
-      }, Switch === undefined ? null : h(Switch, { label: t('Enable multi-device on this computer'), on: enabled, disabled: !available || busy, onChange: toggle })),
-      !available ? h(Row, { label: t('This computer is set up without multi-device (multiDevice: false).') }) : null),
-
-    enabled ? h(Section, { key: 'hub', title: t('This computer') },
-      h(Row, {
+        label: t('Let this computer be the hub'),
+        hint: t('Bots here can reach the machines that join it.'),
+      }, Switch === undefined ? null : h(Switch, { label: t('Let this computer be the hub'), on: enabled, disabled: busy, onChange: toggle })),
+      enabled ? h(Row, {
         label: t(STATE_LABEL[hub.state] ?? STATE_LABEL.failed),
-        hint: hub.error ?? hubHint,
-      }, hubUrl === undefined ? null : h('div', { className: 'bt-dev-url' },
-        h('code', null, hubUrl),
-        h(CopyButton, { text: hubUrl }))),
-      status.sync == null ? null : h(Row, {
-        label: t('Paired machines follow this conversation through the hub, not a browser.'),
-        hint: t('Revision {revision}. A message here reaches them in about a second.', { revision: status.sync.revision }),
-      }),
-      hub.webUrl === undefined ? h(Row, {
-        label: t('Shared chat'),
-        hint: t('This DSH does not report a Web address. Start DSH Web on this computer, then reopen this page.'),
-      }) : h(Row, {
-        label: t('Shared chat'),
-        hint: sharedSessionLink(hub.webUrl).kind === 'forward'
-          ? t('This DSH Web listens on 127.0.0.1 only. On the other machine, forward the port first, then open this address.')
-          : t('Other machines open this address in a browser to see the same conversation.'),
-      }, h('div', { className: 'bt-dev-url' },
-        h('code', null, hub.webUrl),
-        h(CopyButton, { text: hub.webUrl, label: 'Copy address' })),
-      sharedSessionLink(hub.webUrl).kind === 'forward' ? h('div', { className: 'bt-dev-command' },
-        h('code', null, sharedSessionLink(hub.webUrl).command),
-        h(CopyButton, { text: sharedSessionLink(hub.webUrl).command, label: 'Copy command' })) : null),
-      hub.webUrl === undefined ? null : h(Row, {
-        label: t('The login link DSH printed when it started is the credential; this address only opens the page.'),
-      })) : null,
-
-    enabled ? h(Section, { key: 'machines', title: t('Machines · {count}', { count: nodes.length }) },
-      nodes.length === 0
-        ? h(Row, { label: t('No machine is paired yet.'), hint: t('Add one to let the Bots here run commands on it.') })
-        : nodes.map(node => h(NodeRow, {
-          key: node.id,
-          node,
-          confirming: confirming === node.id,
-          busy,
-          onRemove: () => remove(node),
-        })),
-      h('div', { className: 'bt-actions' },
-        h('button', { type: 'button', className: 'bt-soft bt-soft-sm', disabled: busy || hub.state !== 'listening', onClick: addMachine }, t('Add machine'))),
-      confirming ? h('div', { className: 'bt-dev-hint' }, t('{name} must pair again before it can be used. Its running task is cancelled; stop the worker on that machine as well.', { name: nodes.find(node => node.id === confirming)?.name ?? t('The machine') })) : null,
-      pairing === null ? null : h(PairingPanel, { pairing, onClose: () => setPairing(null) })) : null,
-
-    enabled ? h(Section, { key: 'daemon', title: t('Run it all the time') },
-      h(Row, {
-        label: t('Keep the worker running on another machine'),
-        hint: t('Pair that machine once, then run this in the ds-bot folder there. It starts at login and keeps reconnecting after a drop.'),
-      }, status.daemon?.command === undefined ? null : h('div', { className: 'bt-dev-command' },
-        h('code', null, status.daemon.command),
-        h(CopyButton, { text: status.daemon.command, label: 'Copy command' }))),
-      h(Row, { label: t('The command carries no pairing code: the device token stays in device.json on that machine.') })) : null,
-
-    h(Section, { key: 'about', title: t('How it works') },
-      h(Row, { label: t('One hub only. This computer is the hub: the Bots here decide which machine runs a command.') }),
-      h(Row, { label: t('Other machines follow the same conversation through the hub. A browser can still open this computer\'s DS Bot page for the full interface.') }),
-      h(Row, { label: t('To move the hub to another computer, turn multi-device on there and pair the machines again.') }),
-      policy.length === 0 ? null : h(Row, { label: t('Machines run read-only commands directly: {commands}. Anything else asks you first.', { commands: policy.join(', ') }) })),
+        hint: hub.error,
+      }, hub.url === undefined ? null : h('div', { className: 'bt-dev-url' },
+        h('code', null, hub.url),
+        h(CopyButton, { text: hub.url }))) : null,
+      node.error === undefined ? null : h(Row, { label: node.error })),
+    enabled ? hubSection : nearbySection,
   ]
 }
 
@@ -309,6 +408,8 @@ export const DEVICES_CSS = `
 .bt-dev-hint{font-size:12px;line-height:17px;color:var(--bt-ink-2)}
 .bt-dev-command{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bt-card);border:.5px solid var(--bt-line);min-width:0}
 .bt-dev-command code{flex:1}
+.bt-dev-row{display:flex;align-items:center;gap:8px;padding:8px 14px}
+.bt-dev-input{flex:1;min-width:0;padding:6px 8px;border-radius:8px;border:.5px solid var(--bt-line);background:var(--bt-card);color:var(--bt-ink);font:inherit;font-size:12px}
 .bt-dev-strip{display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:6px 10px;margin:0 0 4px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);font:inherit;font-size:12px;text-align:left;cursor:pointer}
 .bt-dev-strip:hover{background:var(--bt-hover)}
 .bt-dev-strip-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
