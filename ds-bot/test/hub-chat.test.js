@@ -38,9 +38,13 @@ const react = {
   },
   useCallback: fn => fn,
   useEffect: fn => { effectCells.push(fn) },
+  useLayoutEffect: fn => { effectCells.push(fn) },
   useMemo: make => make(),
   useContext: ctx => ctx?.value,
-  createContext: initial => ({ value: initial }),
+  // deep-view's ViewUi.Provider sets its value and renders its children.
+  createContext: (initial) => { const ctx = { value: initial }; ctx.Provider = ({ value, children }) => { ctx.value = value; return children }; return ctx },
+  useId: () => 'dv-id',
+  useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const require = (name) => {
   const platform = { react, 'react-dom': {}, '@deepseek-ai/dsh-client-ui-primitives': { MarkdownText: 'MarkdownText' } }
@@ -75,12 +79,14 @@ const renderHubChat = (over = {}) => {
 const flushEffects = () => { const run = effectCells.splice(0); for (const fn of run) fn() }
 const flush = () => new Promise(resolve => setTimeout(resolve, 0))
 
-// Evaluate function components on the way down, then test or collect a node.
+// Evaluate function components on the way down, then test or collect a node. A view
+// card's own components may return null for an unsupported node; those contribute nothing.
 const find = (node, match) => {
   if (Array.isArray(node)) { for (const child of node) { const found = find(child, match); if (found) return found } return null }
   if (node === null || node === undefined || typeof node !== 'object') return null
   let current = node
   while (typeof current?.type === 'function') current = current.type(current.props)
+  if (current === null || current === undefined || typeof current !== 'object') return null
   if (match(current)) return current
   for (const child of current?.children ?? []) { const found = find(child, match); if (found) return found }
   return null
@@ -90,6 +96,7 @@ const collect = (node, match, out = []) => {
   if (node === null || node === undefined || typeof node !== 'object') return out
   let current = node
   while (typeof current?.type === 'function') current = current.type(current.props)
+  if (current === null || current === undefined || typeof current !== 'object') return out
   if (match(current)) out.push(current)
   for (const child of current?.children ?? []) collect(child, match, out)
   return out
@@ -176,8 +183,8 @@ test('an unchanged reply keeps the items and advances the cursor', () => {
 })
 
 test('a full reply replaces the items and an offline reply keeps its flag', () => {
-  assert.deepEqual(plain(applyHubReply(null, { epoch: 'e1', revision: 3, offline: false, items: [{ id: 'a' }] }).view), { offline: false, items: [{ id: 'a' }], earlier: null })
-  assert.deepEqual(plain(applyHubReply({ offline: false, items: [] }, { unchanged: true, offline: true, epoch: 'e1', revision: 3 }).view), { offline: true, items: [], earlier: null })
+  assert.deepEqual(plain(applyHubReply(null, { epoch: 'e1', revision: 3, offline: false, items: [{ id: 'a' }] }).view), { offline: false, items: [{ id: 'a' }], earlier: null, approvals: [] })
+  assert.deepEqual(plain(applyHubReply({ offline: false, items: [] }, { unchanged: true, offline: true, epoch: 'e1', revision: 3 }).view), { offline: true, items: [], earlier: null, approvals: [] })
 })
 
 test('the poll sends the cursor it received so an unchanged reply stays cheap', async () => {
@@ -279,4 +286,108 @@ test('Load earlier prepends the returned page and calls the action once', async 
   assert.equal(called.length, 1)
   const rows = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-hub-user'))
   assert.equal(rows.length, 2, 'the earlier message is prepended before the tail')
+})
+
+test('a display-only view renders through the shared view card', async () => {
+  fresh()
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [
+    { id: 'v1', kind: 'view', title: 'Progress', view: { type: 'metric', label: 'Progress', value: '70%' }, callId: 'c1' },
+  ] })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const inline = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-q-inline'))
+  assert.equal(inline.length, 1, 'the view renders as a card, not nothing')
+})
+
+test('group round events render as event lines', async () => {
+  fresh()
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [
+    { id: 'r1', kind: 'relay', reply: { kind: 'done', botId: 'b1', name: 'Chief' } },
+    { id: 'r2', kind: 'relay', reply: { kind: 'working', botId: 'b2', name: 'Writer' } },
+  ] })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const events = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').includes('bt-hub-event'))
+  assert.equal(events.length, 2, 'each relay row renders one event line')
+})
+
+test('a pending approval renders interactively and a double click answers once', async () => {
+  fresh()
+  const answered = []
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [], approvals: [
+    { id: 'ap1', botId: 'b1', botName: 'Chief', tool: 'run_on_device', reason: 'Run hostname?', detail: { text: 'hostname' }, answerable: true },
+  ] })
+  actions.hubApprovalAnswer = (id, choice) => { answered.push({ id, choice }); return new Promise(() => {}) }
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const allowButton = () => find(tree, node => node.type === 'button' && String(node.props.className ?? '').split(' ').includes('bt-aq-go'))
+  let allow = allowButton()
+  assert.ok(allow, 'an Allow once button is shown')
+  allow.props.onClick()
+  tree = renderHubChat({ actions })
+  allow = allowButton()
+  assert.equal(allow.props.disabled, true, 'the card is busy after the first click')
+  allow.props.onClick()
+  assert.equal(answered.length, 1, 'a double click forwards one request')
+  assert.deepEqual(answered[0], { id: 'ap1', choice: 'allow' })
+})
+
+test('a pending question answers through the hub and a pending view renders', async () => {
+  fresh()
+  const answered = []
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [], question: { id: 'q1', question: 'Approve?', options: [{ label: 'Yes' }, { label: 'No' }], multiSelect: false } })
+  actions.hubQuestionAnswer = (id, kind, questionId, answer) => { answered.push({ id, questionId, answer }); return Promise.resolve({ ok: true }) }
+  actions.hubQuestionDismiss = () => Promise.resolve({ ok: true })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const option = find(tree, node => node.type === 'button' && String(node.props.className ?? '').split(' ').includes('bt-q-opt'))
+  assert.ok(option, 'the pending question renders its options')
+  option.props.onClick()
+  await flush()
+  assert.equal(answered.length, 1, 'choosing an option forwards the answer to the hub')
+  assert.equal(answered[0].questionId, 'q1')
+  assert.equal(answered[0].answer.selected[0], 'Yes')
+})
+
+test('a pending view answers through the hub', async () => {
+  fresh()
+  const answered = []
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [], view: { id: 'v1', title: 'Pick', view: { type: 'options', id: 'pick', options: [{ label: 'A' }, { label: 'B' }] } } })
+  actions.hubViewAnswer = (id, kind, viewId, action, values) => { answered.push({ viewId, action, values }); return Promise.resolve({ ok: true }) }
+  actions.hubViewDismiss = () => Promise.resolve({ ok: true })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const view = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').includes('bt-q-inline'))
+  assert.equal(view.length, 1, 'the pending view renders as a card')
+})
+
+test('a settled answer card stays read-only with no live buttons', async () => {
+  fresh()
+  const actions = minimalActions()
+  actions.hubChat = () => Promise.resolve({ offline: false, epoch: 'e1', revision: 1, items: [
+    { id: 'a1', kind: 'answer', questions: [{ id: 'q2', question: 'Which?', options: ['A', 'B'] }], answers: [{ id: 'q2', selected: ['A'] }] },
+    { id: 'c1', kind: 'closed', question: { question: 'Gone?', options: ['Yes'] }, closed: 'dismissed' },
+  ] })
+  let tree = renderHubChat({ actions })
+  flushEffects()
+  await flush()
+  tree = renderHubChat({ actions })
+  const settled = collect(tree, node => node.type === 'div' && String(node.props.className ?? '').split(' ').includes('bt-q-settled'))
+  assert.equal(settled.length, 2, 'the answered question and the closed question render settled')
+  assert.equal(collect(tree, node => node.type === 'button' && String(node.props.className ?? '').includes('bt-q-opt')).length, 0, 'no live option buttons on a settled card')
 })
