@@ -296,6 +296,7 @@ export function createSessionClient({
       sessionId: body.sessionId ?? null,
       items: Array.isArray(body.items) ? body.items : [],
       hidden: Number.isInteger(body.hidden) ? body.hidden : 0,
+      cursor: body.cursor ?? null,
       updatedAt: body.updatedAt ?? null,
       savedAt: iso(),
     }
@@ -363,6 +364,36 @@ export function createSessionClient({
       return team ?? { bots: [], rooms: [] }
     },
     pull: pullOnce,
+    // The page before a conversation's current tail, prepended to its replica by id so a
+    // page that overlaps the tail is not doubled. `reference` is `bot:<id>` / `room:<id>`.
+    async earlier(reference) {
+      if (team === undefined) await refreshTeam()
+      const found = resolve(reference)
+      const key = `${found.kind}:${found.id}`
+      const conv = convOf(key)
+      if (found.kind === 'bot') { conv.botId = found.id; conv.botName = found.name }
+      else { conv.roomId = found.id; conv.roomName = found.name }
+      const cursor = conv.replica?.cursor
+      if (cursor === undefined || cursor === null) return { items: [], cursor: null }
+      const query = new URLSearchParams()
+      if (conv.roomId !== undefined) query.set('room', conv.roomId)
+      else query.set('bot', conv.botId ?? '')
+      query.set('before', JSON.stringify(cursor))
+      let response
+      try {
+        response = await request(`/session?${query.toString()}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+      } catch (error) {
+        throw failure(`the hub is not reachable; the earlier messages were not loaded (${error.message})`, { code: 'hub/offline' })
+      }
+      const body = await response.json().catch(() => ({}))
+      if (response.status === 401) throw failure('the hub does not know this device; pair it again', { fatal: true })
+      if (!response.ok) throw failure(body.error ?? `the hub refused the earlier messages: HTTP ${response.status}`)
+      const incoming = Array.isArray(body.items) ? body.items : []
+      const merged = mergeItems(conv.replica?.items, incoming)
+      conv.replica = { ...(conv.replica ?? { version: 1, epoch: String(body.epoch ?? ''), revision: 0, reference: key, items: [], cursor: null }), items: merged, cursor: body.cursor ?? null }
+      writeReplica(dataDir, conv.replica)
+      return { items: incoming, cursor: body.cursor ?? null }
+    },
     // Follow a conversation: the next pull and every pull after reads this one. A switch
     // (a different conversation than the one the loop holds) pulls it now, so the view
     // sees fresh data instead of waiting for the loop's long poll to time out; the

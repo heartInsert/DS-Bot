@@ -547,6 +547,14 @@ export function createHub({ dataDir, host = '0.0.0.0', port = 8787, name = 'DS B
       // A conversation is a Bot's own chat (`bot=`) or a group chat (`room=`).
       const room = query.get('room')
       const reference = room !== null && room !== '' ? `room:${room}` : `bot:${query.get('bot') ?? ''}`
+      // `before` pages the conversation's earlier items (a cursor, a seq or an id);
+      // without it a snapshot answers with the current tail.
+      const before = query.get('before')
+      if (before !== null && before !== '') {
+        const page = await sessionSync.earlier(reference, { before })
+        if (response.writableEnded || response.destroyed) return undefined
+        return send(response, 200, page)
+      }
       const snapshot = await sessionSync.snapshot(reference, {
         since: Number.isFinite(since) ? since : undefined,
         epoch: query.get('epoch') ?? undefined,

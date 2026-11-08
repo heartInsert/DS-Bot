@@ -673,6 +673,8 @@ export function install(rt) {
           return ok(await rt.multiDeviceHubConversation(body))
         case 'hub-send':
           return ok(await rt.multiDeviceHubSend(body))
+        case 'hub-earlier':
+          return ok(await rt.multiDeviceHubEarlier(body))
         case 'diagnostics':
           await rt.load()
           return ok(await rt.diagnostics.report(body))
