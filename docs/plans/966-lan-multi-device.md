@@ -444,6 +444,7 @@ node dev/lan-sync-accept.mjs status | stop
 - 2026-11-08：v5（Windows 中心的加入请求不出现、加入后团队没有跟过来）——待批请求落盘并在页面上独立显示、双栈监听与虚拟网卡过滤、加入前确认与时间戳备份、`GET /team` 的白名单团队同步、回滚与重连幂等、`dev/multi-node-sim.mjs`。
 - 2026-11-08：v6（节点界面渲染中心会话）——`/session` 从「只跟一个 Bot」扩展成「每个会话一个游标」，覆盖每个 Bot 私聊和每个群聊；节点侧 `session-client` 支持切换会话、按 id 去重、离线状态与拒绝发送；加入后节点按计时器重读 `/team`，中心新增/改名/删除的 Bot 与群聊持续同步过来。中心会话视图摆在会话区（不盖侧栏）、发送从界面就带幂等 id 且乐观对账、`hub-chat` 按游标回 `unchanged` 让轮询变便宜、回复复用主会话的 `MarkdownText`。
 - 2026-11-08：v7（Hub 侧持久化发送去重）——接受过的 `messageId` 落盘到 `<dataDir>/send-dedupe.json`（原子写、0600、按会话分组、7 天 / 每会话 1000 / 全局 10000 的保留策略）；写入前落 pending、写入后落 committed，重启后按「会话尾部是否有同文本用户消息」对账，写清唯一的重复/丢失窗口并坚持 at-most-once（绝不重跑模型回合）；并发同 id 由 in-flight 收敛到一次写。`test/lan-send-dedupe.test.js` 覆盖重启去重、保留剪枝、损坏文件、崩溃对账与并发。
+- 2026-11-08：v8（节点渲染并转发卡片）——快照新增待批 `approvals`/`question`/`view`；`hub-chat.js` 渲染纯展示视图（`WidgetCell`）、群回合 `relay` 事件行、已答/已关卡片，并用 `ApprovalCard`/`PendingQuestion`/`PendingView` 交互式渲染待批卡；新增设备令牌端点 `POST /session/approval`、`/session/question`、`/session/question-dismiss`、`/session/view`、`/session/view-dismiss`，按卡片 id 幂等、已解决/已过期/未知回明确结果且绝不重放工具；`channel.js` 抽出 `rt.answerView`/`dismissQuestion`/`dismissView`，节点 `session-client` 与 `/api/bot` 的 `hub-*` 端点把回答转发到 Hub。`test/lan-cards.test.js` 覆盖鉴权、幂等、过期/已解决/未知、离线拒绝发送与转发；`test/hub-chat.test.js` 覆盖各卡片类型的交互与只读渲染。
 
 ## v6 做了什么（节点界面渲染中心会话，长期设计）
 
@@ -534,63 +535,66 @@ v6 的去重 `messageId` 只在 Hub 进程内存里：Hub 一重启（桌面应�
 
 `test/lan-send-dedupe.test.js` 覆盖十条：Hub 重启后同 id 只写一次且返回同一 `acceptedAt`、不同 id 写两条、同 id 在 bot 与 room 里各写一条、每会话只留最新 N 条、超 7 天被丢弃、损坏文件从空开始且继续可用、pending 且已写→对账为已写、pending 且未写→丢弃并让重试写一次、两条并发同 id 只写一条、落盘文件的原子写与引用字段。协议层不需要 DSH 和模型密钥。
 
-## v7 gaps: cards（节点侧的审批/问题/工具卡）
+## v8 做了什么（节点渲染并转发卡片，长期设计）
 
-节点聊天界面 `src/client/hub-chat.js` 只渲染 `divider`/`event`/`post`/`bot`/`user`，审批卡、问题卡、工具卡都不显示，节点用户看不到、也就没法操作。这一节把「哪些组件能渲染它们、哪些端点能解决它们、要补什么」写清楚。
+v7 的结论是「节点界面只渲染 `divider`/`event`/`post`/`bot`/`user`，审批卡、问题卡、工具卡都不显示」。v8 把这些缺口全部补上：节点看到的不再是只有文本的副本，而是和主会话同一套卡片组件渲染的对话——待批的审批/问题/视图可以交互，已关闭/已答的只读，群回合事件行按主群聊的样子显示。所有回答都从节点经设备令牌转发到 Hub，由 Hub 走它已有的解答路径，节点自己不跑工具、不重复执行任何已发生的动作。
 
-### 现状：卡片与端点
+### 快照里新增的活卡片
 
-**快照里到底有什么。** `/session` 的 `items` 来自 `parts.js` 的 `displayItems`（`chatPage`/`roomPage` 共用），它只产出这几种：`user`、`bot`、`post`、`event`、`relay`、`answer`、`closed`、`view`、`divider`。其中与卡片相关的是：
+`session-sync.js` 的 `render` 在 `items` 之外再带三样（它们都是活 DSH 状态，不在 `displayItems` 里）：
 
-- `ask_user` 的问题卡：已关闭的卡片以 `closed` 行出现（`parts.js:1446`，带 `question` 和 `closed`）；已回答的以 `answer` 行出现（`parts.js:1487`，带 `questions`/`answers`）。
-- `show_view` 的视图卡：纯展示的以 `view` 行出现（`parts.js:1452`，带 `title`/`view`）；关闭或已答的以 `closed`（带 `view`）或 `answer`（带 `views`/`answers`）出现。
-- `group_relay` 的群回合结果以 `relay`/`post`/`user` 行出现（`parts.js:1471-1473`）。
+- `approvals`：属于这个会话的待批审批（`rt.approvalsView()` 按 `sessionId`/`roomId` 过滤），每项 `{id, botId, botName, tool, reason, detail, answerable, at}`。Bot 私聊匹配 `roomId === undefined && botId === 该 Bot`，群聊匹配 `roomId === 该群`。
+- `question`：这个 Bot 当前 chat part 的待批问题（`state.questions[chatOf(botId)]`，仅 Bot 私聊）。
+- `view`：这个 Bot 的待批 `show_view`（`state.views[chatOf(botId)]`，仅 Bot 私聊）。
 
-**审批卡不在快照里。** 审批是活的 DSH 状态：`approvals.js` 在 `ctx.on('approval/request', ...)` 里把每个待批请求收进内存 `pending` Map，`approvalsView()` 把它放进 `/api/bot` 的 live 回答（`channel.js:107` 的 `work.approvals`），从不进入 `displayItems`。所以节点要看到审批卡，必须让 Hub 在快照里额外带一份审批视图——这是协议改动，不是纯渲染。
+这三样进入快照的 `key` 摘要，所以审批/问题/视图的增删会像消息一样推高 `revision`、唤醒长轮询；节点副本和 `hubChatAnswer` 把它们原样带过去，`hub-chat.js` 的 `applyHubReply` 把它们放进视图。
 
-**渲染这些卡的组件（主会话在用的）：**
+### 渲染（`src/client/hub-chat.js`）
 
-| 卡片 | 组件 | 文件 |
-|---|---|---|
-| 待批问题（`ask_user`） | `PendingQuestion` | `src/client/questions.js:188` |
-| 已关闭问题（只读） | `SettledQuestion` | `src/client/questions.js:149` |
-| 已答问题（只读） | `AnsweredCell`（经 `AnsweredReply` 分派） | `src/client/questions.js:226` |
-| 待批/纯展示视图（`show_view`） | `WidgetCell` / `PendingView` / `Card`（`deep-view/react`） | `src/client/widget-cell.js:51` |
-| 已关闭视图（只读） | `ClosedView`（就是 `SettledQuestion` 包一层标题） | `src/client/widget-cell.js:78` |
-| 已答视图（只读） | `AnsweredView`（经 `AnsweredReply` 分派） | `src/client/widget-cell.js:93` |
-| 审批队列（Allow once / Reject） | `ApprovalQueue` / `ApprovalCard` | `src/client/approval-queue.js:87,120` |
-| 一般工具调用/结果 | `ToolCell`（读活 DSH 投影 `node.data.root`，不在快照里） | `src/client/cells.js:1163` |
+`Row` 现在覆盖全部卡片行，`HubChat` 在消息列表末尾再渲染活卡片：
 
-**解决这些卡的端点（`/api/bot`，`channel.js` 的路由）：**
+- `view`（纯展示 `show_view`）→ `WidgetCell`（`done:true`，从快照里 `title`/`view` 重放蓝图）；`deep-view/react`、`handoff-card.js`、`computer.js` 随它进依赖，主 `client.js` 本就整体打包，测试 bundle 用 `chat-rows.test.js` 同款 react stand-in（补 `useSyncExternalStore`/`useId`/`useLayoutEffect` 和带 Provider 的 `createContext`）。
+- `relay`（群回合事件）→ 只读事件行，用 `RelayEvent` 同样的 i18n 文案（`{name} 完成/暂停等待审批/开始/停止/失败…`），不接 `actions.showDetails`。
+- `answer` → `AnsweredReply`（分发到 `AnsweredView`/`AnsweredCell`/`SettledHandoff`），而不是此前只退文本的 `AnsweredCell`。
+- `closed` → `SettledQuestion`（问题或标题当问题，等价 `ClosedView`）。
+- `event` → 群回合的 `Replies from` / `Stopped by` / `Reply from` / `Message from`。
+- 待批 `approvals` → `ApprovalCard`（`approval-queue.js` 里原本私有的组件现已导出，`Allow once`/`Reject`）；待批 `question` → `PendingQuestion`；待批 `view` → `PendingView`。这三者经 `cardActions` 把回答转发到 Hub，而不是本机 `/api/bot`。
 
-- 审批：`approval-answer` → `rt.answerApproval(id, choice)`（`channel.js:385`，`approvals.js:100`）。`approval/request` 是 DSH 钩子，不是 HTTP 端点。
-- 问题：`answer-question` → `rt.answerQuestion(sessionId, questionId, answer)`（`channel.js:474` → `channel.js:720`）；`dismiss-question`（`channel.js:411`）。
-- 视图：`view-reply` → `rt` 的 `viewReply`（`channel.js:479`）。
-- 节点对 Hub 的通道：`hub-chat` / `hub-send`（`channel.js:672-675` → `tools.js` 的 `multiDeviceHubConversation` / `multiDeviceHubSend`）。
+工具结果的「不重执行」由两条保证：节点只读渲染 `relay`/`answer`/`view`/`event` 这些工具产出的行；ds-bot 工具的结果（`run_on_device` 等的 stdout）本来就经 `output` 渲染成 Bot 的回复文本（`bot` 行），节点照常显示、从不触发模型回合或工具。审批回答也只调 `answerApproval`，它要么解决仍在 `pending` 的请求，要么报 `bot/stale`，不执行工具。
 
-### 本轮已做：只读渲染问题卡与关闭的视图卡
+### 转发的 Hub 端点（设备令牌鉴权，`hub.js` 的 `handleSession`）
 
-`hub-chat.js` 的 `Row` 现在补了三种只读渲染，复用主会话历史用的同一组件：
+| 方法 | 路径 | 载荷 | 作用 |
+|---|---|---|---|
+| `POST` | `/session/approval` | `{approvalId, choice}` | 解答审批：`rt.answerApproval` |
+| `POST` | `/session/question` | `{botId, questionId, answer}` | 回答问题：`rt.answerQuestion` |
+| `POST` | `/session/question-dismiss` | `{botId}` | 驳回问题：`rt.dismissQuestion` |
+| `POST` | `/session/view` | `{botId, viewId, action, values}` | 解答视图：`rt.answerView` |
+| `POST` | `/session/view-dismiss` | `{botId}` | 驳回视图：`rt.dismissView` |
 
-- `answer` → `AnsweredCell`（`questions.js`）：已答问题显示成「问题 + 选项带字母 + 用户选中的答案」；视图/交接的答复则退回显示答复文本。
-- `closed` 且带 `question` → `SettledQuestion`：关闭的问题卡，带 `closedLabel` 徽标。
-- `closed` 且带 `view` → `SettledQuestion`（标题当问题）：等价于主会话的 `ClosedView`。
+`channel.js` 把视图/驳回逻辑从内联路由抽成 `rt.answerView`/`rt.dismissQuestion`/`rt.dismissView`（与已有的 `rt.answerQuestion` 并列），所以 Hub 转发和 `/api/bot` 的 `answer-question`/`view-reply`/`dismiss-*` 走的是同一条解答路径。
 
-这些卡片是快照里本来就有、且已经「关闭/已答」的，天然只读，复用 `questions.js` 的纯组件即可，不需要 `deep-view`。CSS 就是全局 `styles.js` 里的 `bt-q*`。测试：`test/hub-chat.test.js` 新增一条——关闭的问题、关闭的视图、已答的问题都渲染成 `.bt-q-settled` 只读卡，且没有活选项按钮。
+### 幂等与过期
 
-### 仍缺的（精确列出，含步骤）
+- **按卡片 id 幂等。** `session-sync.js` 记住自己解决过的审批/问题/视图 id；同一 id 的第二次解答返回 `{ok:true, duplicate:true}`（审批还带第一次的 `outcome`），什么都不做。
+- **已解决/已过期/未知。** 卡片不在 `pending` 且不是本进程刚解决的，Hub 返回 409 和一句明确的话（`This approval/question/view is no longer open`），不改任何状态；节点 `session-client` 把它标成 `bot/stale`，界面把卡片变只读（审批卡显示原因、可 Dismiss；问题/视图在下一次轮询里消失）。
+- **节点不执行工具。** 转发只调用 Hub 已有的解答函数，绝不重放工具调用或模型回合；连不上 Hub 时 `session-client` 抛 `hub/offline`，界面明确离线、不落到本机。
 
-**1. 纯展示视图 `view` 行（show_view 的 `await_reply:false` 展示卡）。** `displayItems` 把这类卡放进 `view` 行（带 `title`/`view`），但 `Row` 还没处理它。要渲染它得用 `widget-cell.js` 的 `WidgetCell`（`done:true` 路径）或其底层 `Card`（`deep-view/react` 的 `WidgetCard`），这会把 `deep-view/react`、`handoff-card.js`、`computer.js` 拽进 hub-chat 的依赖和测试 bundle。步骤：`hub-chat.js` `Row` 加 `kind === 'view'` 分支，用 `WidgetCell({ done:true, args:{ text: n=>n==='title'?item.title:undefined, value: n=>n==='view'?item.view:undefined } })`；把 `HUB_CHAT_CSS` 与 `widget-cell.js` 的 `WIDGET_CSS` 一起注入；在 `hub-chat.test.js` 的 esbuild 里 external 掉 `deep-view/react` 并在 react stand-in 补 `deep-view` 桩。
+### 节点侧通道
 
-**2. 审批卡的只读渲染 + 转发。** 审批不在快照里。步骤：(a) `session-sync.js` 的 `render`/`viewOf` 把 `rt.approvalsView()` 里属于该会话的审批（按 `sessionId`/`roomId`）加进快照（`approval` 行，带 `id`/`tool`/`reason`/`detail`/`botId`/`answerable`）；(b) 节点 `hub-chat.js` 用 `ApprovalCard` 的只读变体渲染；(c) 转发：新增 Hub 端点 `POST /session/approval`（`{approvalId, choice}`，设备令牌鉴权，按审批 id 幂等，已过期/已解决回明确结果），Hub 侧 `sessionSync` 拿到后调 `rt.answerApproval`（与 `approval-answer` 同一条路径）。关键约束：**永远不重放工具**——审批转发只调 `answerApproval`，它要么解决一个仍在 `pending` 的请求，要么报 `bot/stale`，不会执行任何工具。
+`session-client` 新增 `answerApproval`/`answerQuestion`/`dismissQuestion`/`answerView`/`dismissView`；`tools.js` 的节点封装暴露 `multiDeviceHubApprovalAnswer`/`multiDeviceHubQuestionAnswer`/`multiDeviceHubQuestionDismiss`/`multiDeviceHubViewAnswer`/`multiDeviceHubViewDismiss`，对应 `/api/bot` 的 `hub-*` 端点（`channel.js`）。客户端的 `index.js` 给 `actions` 加了 `hubApprovalAnswer`/`hubQuestionAnswer`/`hubQuestionDismiss`/`hubViewAnswer`/`hubViewDismiss`。
 
-**3. 节点侧交互卡的端到端转发。** 问题/视图的「回答/驳回」要从节点经设备令牌转发到 Hub：新增 Hub 端点（如 `POST /session/question`、`POST /session/view`），按卡片 id 幂等；节点 `hub-chat.js` 的 `actions` 里把 `answerQuestion`/`dismissQuestion`/`answerView` 改成走 `hub-send` 一类的转发端点而不是本机 `/api/bot`。已过期/已解决 → 回明确结果并把卡片变只读，绝不重执行。
+### 验收
 
-**4. `relay` 行（群回合事件）。** 快照里的 `relay` 行（`reply.kind`：`approval`/`working`/`done`/`stopped`/`failed` 等）当前不渲染。主会话用 `cells.js` 的 `RelayEvent`（`cells.js:920`）。步骤：`Row` 加 `relay` 分支；`RelayEvent` 依赖 `roster`/`actions`（打开成员、展示详情），只读版可以只显示事件文本（`{name} 开始/等待审批/完成`），不接 `actions`。
+- `test/lan-cards.test.js`（协议层，不起 DSH）：设备令牌鉴权（无/错 token → 401）、审批按 id 幂等（第二次 `duplicate:true` 且只解决一次）、已在他处解决/已过期/未知 id → 409 且不改状态、快照带 `approvals`/`question`/`view`（群审批归群不归 Bot 私聊）、问题/视图的回答与驳回转发、session-client 转发审批、连不上 Hub 时节点拒绝发送（`hub/offline`）。
+- `test/hub-chat.test.js`（客户端，react stand-in）：纯展示视图渲染成卡片、群回合事件行、待批审批交互且双击只发一次请求、待批问题/视图渲染并转发、已答/已关闭卡只读无活按钮。
 
-### 结论
+### 云上仍不可测的（与卡片无关，需真机或人工）
 
-「只读渲染问题卡与关闭视图卡」本轮已落地（小且安全）。审批卡的只读显示和 approve/deny/answer 转发、纯展示 `show_view` 卡、`relay` 事件行都还是缺口：前两者要动协议（快照带审批、新转发端点）并牵出 `deep-view` 依赖，属「非小改动」，留待后续按上面步骤做。
+- UDP 广播发现（`discovery.js`）：云环境不模拟局域网广播，`test/lan-discovery.test.js` 用注入的接口与临时端口覆盖，真机广播仍需双机清单。
+- Windows 防火墙对 8787/TCP 的放行、macOS 首启的本地网络权限弹窗：只有真机能验。
+- 常驻 worker 与守护安装（launchd/systemd/登录计划任务）：`daemon.js` 只测生成的文件内容，实际开机自启要真机。
+- 桌面安装器与更新：`app/` 的打包/签名/安装流程不在协议测试范围。
 
 ## v7: 加载更早的消息（Load earlier）
 
